@@ -1,0 +1,23 @@
+parameters: {}
+environment:
+  OPENAI_API_KEY: ""
+  MONGO_URI: ""
+packages:
+  - name: task1
+    shared: false
+    environment: {}
+    parameters: {}
+    annotations: {}
+    functions:
+      - name: send-for-embed
+        runtime: nodejs:default
+      - name: mongodb-test
+        runtime: nodejs:default
+      - name: retrieve-embed
+        runtime: nodejs:default
+      - name: add-to-rag
+        runtime: nodejs:default
+        environment:
+          WEAVIATE_API_KEY: ""
+          WEAVIATE_API_HOST: ""
+
