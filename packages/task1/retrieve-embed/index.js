@@ -1,262 +1,337 @@
 import { MongoClient } from 'mongodb';
 import axios from 'axios';
+import { v4 as uuidv4 } from 'uuid';
+import winston from 'winston';
 
-/**
- * RetrieveEmbed - Retrieves embedding results from OpenAI and merges them with original chunks
- * This function will be triggered via Cron
- */
-export async function main(params) {    // Configuration
-    const config = {
-        mongoUri: process.env.MONGO_URI,
-        openAiApiKey: process.env.OPENAI_API_KEY,
-        embeddingModel: process.env.EMBEDDING_MODEL || 'text-embedding-ada-002',
-        batchProcessLimit: parseInt(process.env.BATCH_PROCESS_LIMIT || '10'), // Max batches to process in one run
-        retryAttempts: parseInt(process.env.RETRY_ATTEMPTS || '3'),
-        retryDelay: parseInt(process.env.RETRY_DELAY || '1000') // ms
+// Configure logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console()
+    ]
+});
+
+// Constants
+const timeLimit = 850000; // 850 seconds (14min 10sec) to leave buffer before the 15min limit
+const MAX_BATCH_SIZE = 8; // Maximum chunks per batch
+const CHECKPOINT_INTERVAL = 100; // Save checkpoint every 100 documents
+
+// Configuration
+const config = {
+    // MongoDB configuration
+    mongoUri: process.env.MONGO_URI,
+    databaseName: process.env.DB_NAME || 'CORE_POC_DEV',
+
+    // OpenAI configuration
+    openAiApiKey: process.env.OPENAI_API_KEY,
+    embeddingModel: process.env.EMBEDDING_MODEL || 'text-embedding-ada-002',
+    batchSize: Math.min(parseInt(process.env.BATCH_SIZE || '8'), MAX_BATCH_SIZE),
+
+    // Process ID (from args or generate new one)
+    processId: process.env.PROCESS_ID
+};
+
+// Initialize OpenAI client
+const openaiClient = axios.create({
+    baseURL: 'https://api.openai.com/v1',
+    headers: {
+        'Authorization': `Bearer ${config.openAiApiKey}`,
+        'Content-Type': 'application/json'
+    }
+});
+
+async function getLastUnfinishedProcessId(db) {
+    const lastProcess = await db.collection('AI_TEMP')
+        .findOne(
+            {
+                type: 'retrieve_checkpoint',
+                processedCount: { $exists: true } // Ensure it's a process that has started
+            },
+            { sort: { timestamp: -1 } }
+        );
+
+    if (lastProcess) {
+        logger.info(`Found last unfinished process ID: ${lastProcess.processId}`);
+        return lastProcess.processId;
+    }
+
+    return null;
+}
+
+async function getProcessId(db) {
+    // First try to use the process ID from environment variable
+    if (config.processId) {
+        logger.info(`Using process ID from environment: ${config.processId}`);
+        return config.processId;
+    }
+
+    // If no process ID in env, try to get the last unfinished process
+    const lastProcessId = await getLastUnfinishedProcessId(db);
+    if (lastProcessId) {
+        return lastProcessId;
+    }
+
+    // If no unfinished process exists, create a new one
+    const newProcessId = `retrieve-process-${uuidv4()}`;
+    logger.info(`No previous process found, created new process ID: ${newProcessId}`);
+    return newProcessId;
+}
+
+async function getCheckpoint(db, processId) {
+    const checkpoint = await db.collection('AI_TEMP').findOne({
+        type: 'retrieve_checkpoint',
+        processId: processId
+    });
+    return checkpoint || {
+        lastProcessedId: null,
+        batchId: null,
+        processedCount: 0,
+        lastSource: null
     };
+}
 
-    let client = null;
-    const processedBatches = [];
-    const failedBatches = [];
+async function saveCheckpoint(db, checkpoint, processId) {
+    await db.collection('AI_TEMP').updateOne(
+        {
+            type: 'retrieve_checkpoint',
+            processId: processId
+        },
+        {
+            $set: {
+                ...checkpoint,
+                timestamp: new Date(),
+                processId: processId
+            }
+        },
+        { upsert: true }
+    );
+}
+
+async function getPendingBatches(db, lastProcessedId) {
+    const query = lastProcessedId
+        ? { _id: { $gt: lastProcessedId } }
+        : {};
+
+    return await db.collection('AI_EMBEDDING')
+        .aggregate([
+            { $match: { ...query, timestamp: { $exists: false } } },
+            { $group: { _id: '$batch_id' } },
+            { $sort: { _id: 1 } }
+        ])
+        .toArray();
+}
+
+async function getBatchDocuments(db, batchId) {
+    return await db.collection('AI_EMBEDDING')
+        .find({ batch_id: batchId, timestamp: { $exists: false } })
+        .toArray();
+}
+
+async function updateEmbeddingDocuments(db, documents, processId) {
+    const bulkOps = documents.map(doc => ({
+        updateOne: {
+            filter: { _id: doc._id },
+            update: {
+                $set: {
+                    timestamp: new Date(),
+                    processId: processId
+                }
+            }
+        }
+    }));
+
+    if (bulkOps.length > 0) {
+        await db.collection('AI_EMBEDDING').bulkWrite(bulkOps);
+    }
+}
+
+async function getOriginalChunk(db, vectorId) {
+    const [source, pageCounter, chunkId] = vectorId.split('__').map(part => part.replace(/^[pc]/, ''));
+    return await db.collection('MATRIX_CHUNKED').findOne({
+        source,
+        page_counter: parseInt(pageCounter),
+        chunk_id: parseInt(chunkId)
+    });
+}
+
+async function createRagDocument(embeddingDoc, originalChunk) {
+    return {
+        id: embeddingDoc.vector_id,
+        vector: embeddingDoc.vector,
+        properties: {
+            chunk_id: originalChunk.chunk_id,
+            page_counter: originalChunk.page_counter,
+            source: originalChunk.source,
+            rag_timestamp: null, // Will be updated after Weaviate insertion
+            html_content: originalChunk.html_content,
+            metadata: originalChunk.metadata
+        }
+    };
+}
+
+async function getEmbeddingsFromOpenAI(texts) {
+    try {
+        const response = await openaiClient.post('/embeddings', {
+            input: texts,
+            model: config.embeddingModel
+        });
+
+        return response.data.data.map(item => item.embedding);
+    } catch (error) {
+        logger.error('Error getting embeddings from OpenAI:', error);
+        throw error;
+    }
+}
+
+async function processBatch(db, batchId, checkpoint, processId) {
+    logger.info(`Processing batch ${batchId} for process ${processId}`);
+
+    const documents = await getBatchDocuments(db, batchId);
+    if (documents.length === 0) {
+        logger.info(`No documents found for batch ${batchId}`);
+        return checkpoint;
+    }
 
     try {
-        // Connect to MongoDB
-        client = new MongoClient(config.mongoUri);
+        // Get original chunks for the batch
+        const originalChunks = await Promise.all(
+            documents.map(doc => getOriginalChunk(db, doc.vector_id))
+        );
 
-        await client.connect();
-        console.log('[RetrieveEmbed] Connected to MongoDB');
-
-        const db = client.db();
-        const embeddingCollection = db.collection('AI_EMBEDDING');
-        const chunkedCollection = db.collection('MATRIX_CHUNKED');
-        const forRagCollection = db.collection('AI_FOR_RAG');
-
-        // Find batches that need to be retrieved (no timestamp)
-        // Also filter out batches with error flag that have been retried too many times
-        const batchesToRetrieve = await embeddingCollection.aggregate([
-            {
-                $match: {
-                    timestamp: null,
-                    $or: [
-                        { retry_count: { $exists: false } },
-                        { retry_count: { $lt: config.retryAttempts } }
-                    ]
-                }
-            },
-            { $group: { _id: "$batch_id" } },
-            { $limit: config.batchProcessLimit }
-        ]).toArray();
-
-        if (batchesToRetrieve.length === 0) {
-            console.log('[RetrieveEmbed] No batches to retrieve');
-            return {
-                success: true,
-                message: 'No batches to retrieve',
-                stats: { processed: 0, failed: 0 }
-            };
+        // Filter out any missing chunks
+        const validChunks = originalChunks.filter(chunk => chunk !== null);
+        if (validChunks.length === 0) {
+            logger.warn(`No valid chunks found for batch ${batchId}`);
+            return checkpoint;
         }
 
-        const batchIds = batchesToRetrieve.map(b => b._id);
-        console.log(`[RetrieveEmbed] Found ${batchIds.length} batches to retrieve: ${batchIds.join(', ')}`);
+        // Get embeddings from OpenAI
+        const texts = validChunks.map(chunk => chunk.html_content);
+        const embeddings = await getEmbeddingsFromOpenAI(texts);
 
-        // Process each batch
-        for (const batchData of batchesToRetrieve) {
-            const batchId = batchData._id;
-            console.log(`[RetrieveEmbed] Processing batch ${batchId}`);
+        // Update documents with embeddings and timestamps
+        const updatedDocuments = documents.map((doc, index) => {
+            if (index < embeddings.length) {
+                return {
+                    ...doc,
+                    vector: embeddings[index],
+                    timestamp: new Date(),
+                    processId: processId
+                };
+            }
+            return doc;
+        });
+
+        // Update documents in MongoDB
+        await updateEmbeddingDocuments(db, updatedDocuments, processId);
+
+        // Update checkpoint
+        const lastDocument = updatedDocuments[updatedDocuments.length - 1];
+        checkpoint.lastProcessedId = lastDocument._id;
+        checkpoint.processedCount += updatedDocuments.length;
+        checkpoint.lastSource = lastDocument.source;
+
+        // Save checkpoint periodically
+        if (checkpoint.processedCount % CHECKPOINT_INTERVAL === 0) {
+            await saveCheckpoint(db, checkpoint, processId);
+            logger.info(`Saved checkpoint at ${checkpoint.processedCount} documents`);
+        }
+
+        // Process each document for RAG
+        for (let i = 0; i < updatedDocuments.length; i++) {
+            const embeddingDoc = updatedDocuments[i];
+            const originalChunk = validChunks[i];
 
             try {
-                // Get all documents for this batch
-                const batchDocuments = await embeddingCollection.find({ batch_id: batchId }).toArray();
+                // Create RAG document
+                const ragDoc = await createRagDocument(embeddingDoc, originalChunk);
 
-                if (batchDocuments.length === 0) {
-                    console.log(`[RetrieveEmbed] No documents found for batch ${batchId}`);
-                    continue;
-                }
-
-                console.log(`[RetrieveEmbed] Found ${batchDocuments.length} documents in batch ${batchId}`);
-
-                // Create input array for OpenAI embedding API
-                const contentArray = batchDocuments.map(doc => doc.html_content);
-
-                // Retrieve embeddings from OpenAI with retries
-                let embeddings = null;
-                let attempts = 0;
-                let success = false;
-
-                while (!success && attempts < config.retryAttempts) {
-                    attempts++;
-                    try {
-                        // Send request to OpenAI
-                        const response = await axios.post(
-                            'https://api.openai.com/v1/embeddings',
-                            {
-                                model: config.embeddingModel,
-                                input: contentArray
-                            },
-                            {
-                                headers: {
-                                    'Authorization': `Bearer ${config.openAiApiKey}`,
-                                    'Content-Type': 'application/json'
-                                },
-                                timeout: 60000 // 60 seconds timeout for larger batches
-                            }
-                        );
-
-                        embeddings = response.data.data;
-                        success = true;
-
-                        console.log(`[RetrieveEmbed] Successfully retrieved embeddings for batch ${batchId}`);
-                    } catch (error) {
-                        const status = error.response?.status;
-
-                        // Handle different error types
-                        if (status === 429) {
-                            // Rate limit error - back off and retry
-                            const retryAfter = error.response.headers['retry-after']
-                                ? parseInt(error.response.headers['retry-after']) * 1000
-                                : config.retryDelay * Math.pow(2, attempts);
-
-                            console.warn(`[RetrieveEmbed] Rate limit hit, retrying after ${retryAfter}ms`);
-                            await new Promise(resolve => setTimeout(resolve, retryAfter));
-                        } else if (status >= 500) {
-                            // Server error - retry with exponential backoff
-                            const backoffTime = config.retryDelay * Math.pow(2, attempts);
-                            console.warn(`[RetrieveEmbed] OpenAI server error (${status}), retrying after ${backoffTime}ms`);
-                            await new Promise(resolve => setTimeout(resolve, backoffTime));
-                        } else {
-                            // Other errors - log and retry with delay
-                            console.error(`[RetrieveEmbed] Error retrieving embeddings for batch ${batchId}:`, error.response?.data || error.message);
-
-                            if (attempts < config.retryAttempts) {
-                                const backoffTime = config.retryDelay * Math.pow(2, attempts);
-                                console.warn(`[RetrieveEmbed] Retrying in ${backoffTime}ms (attempt ${attempts + 1}/${config.retryAttempts})`);
-                                await new Promise(resolve => setTimeout(resolve, backoffTime));
-                            } else {
-                                console.error(`[RetrieveEmbed] Failed to retrieve embeddings for batch ${batchId} after ${config.retryAttempts} attempts`);
-
-                                // Update retry count for all documents in the batch
-                                await embeddingCollection.updateMany(
-                                    { batch_id: batchId },
-                                    {
-                                        $inc: { retry_count: 1 },
-                                        $set: { last_error: error.message, last_retry: new Date() }
-                                    }
-                                );
-
-                                failedBatches.push(batchId);
-                                throw new Error(`Failed to retrieve embeddings after ${config.retryAttempts} attempts: ${error.message}`);
-                            }
-                        }
-                    }
-                }
-
-                if (!embeddings) {
-                    console.error(`[RetrieveEmbed] No embeddings retrieved for batch ${batchId}`);
-                    failedBatches.push(batchId);
-                    continue;
-                }
-
-                // Process documents
-                const timestamp = new Date();
-
-                for (let i = 0; i < batchDocuments.length; i++) {
-                    const doc = batchDocuments[i];
-                    const embedding = embeddings[i].embedding;
-
-                    try {
-                        // Update the document with the embedding and timestamp
-                        await embeddingCollection.updateOne(
-                            { batch_id: batchId, vector_id: doc.vector_id },
-                            {
-                                $set: {
-                                    vector: embedding,
-                                    timestamp: timestamp
-                                }
-                            }
-                        );
-
-                        console.log(`[RetrieveEmbed] Updated embedding for ${doc.vector_id}`);
-
-                        // Parse vector_id to get original document info
-                        const vectorIdParts = doc.vector_id.split('__');
-                        const source = vectorIdParts[0];
-                        const pageCounter = parseInt(vectorIdParts[1].substring(1));
-                        const chunkId = parseInt(vectorIdParts[2].substring(1));
-
-                        // Get the original document from MATRIX_CHUNKED
-                        const originalDoc = await chunkedCollection.findOne({
-                            source: source,
-                            page_counter: pageCounter,
-                            chunk_id: chunkId
-                        });
-
-                        if (!originalDoc) {
-                            console.error(`[RetrieveEmbed] Original document not found for ${doc.vector_id}`);
-                            continue;
-                        }
-
-                        // Merge data and insert into AI_FOR_RAG
-                        const mergedDoc = {
-                            id: doc.vector_id,
-                            vector: embedding,
-                            properties: {
-                                chunk_id: originalDoc.chunk_id,
-                                page_counter: originalDoc.page_counter,
-                                source: originalDoc.source,
-                                rag_timestamp: null, // Will be updated after insertion in Weaviate
-                                html_content: originalDoc.html_content,
-                                metadata: originalDoc.metadata
-                            }
-                        };
-
-                        // Upsert into AI_FOR_RAG
-                        await forRagCollection.updateOne(
-                            { id: doc.vector_id },
-                            { $set: mergedDoc },
-                            { upsert: true }
-                        );
-
-                        console.log(`[RetrieveEmbed] Merged and inserted document for ${doc.vector_id}`);
-                    } catch (error) {
-                        console.error(`[RetrieveEmbed] Error processing document ${doc.vector_id}:`, error.message);
-                    }
-                }
-
-                processedBatches.push(batchId);
-                console.log(`[RetrieveEmbed] Successfully processed batch ${batchId}`);
-
+                // Insert into AI_FOR_RAG collection
+                await db.collection('AI_FOR_RAG').insertOne(ragDoc);
+                logger.info(`Inserted RAG document for ${embeddingDoc.vector_id}`);
             } catch (error) {
-                console.error(`[RetrieveEmbed] Error processing batch ${batchId}:`, error.message);
-                failedBatches.push(batchId);
+                logger.error(`Error processing document ${embeddingDoc.vector_id}:`, error);
             }
         }
 
-        return {
-            success: true,
-            message: `Retrieved embeddings for ${processedBatches.length} batches (${failedBatches.length} failed)`,
-            stats: {
-                processed: processedBatches.length,
-                failed: failedBatches.length,
-                processedBatches,
-                failedBatches
-            }
-        };
+        return checkpoint;
     } catch (error) {
-        console.error('[RetrieveEmbed] Fatal error:', error);
-        return {
-            success: false,
-            error: error.message,
-            stats: {
-                processed: processedBatches.length,
-                failed: failedBatches.length,
-                processedBatches,
-                failedBatches
+        logger.error(`Error processing batch ${batchId}:`, error);
+        throw error;
+    }
+}
+
+async function retrieveEmbed() {
+    const startTime = Date.now();
+    const client = new MongoClient(config.mongoUri);
+
+    try {
+        await client.connect();
+        const db = client.db(config.databaseName);
+
+        // Get process ID based on priority
+        const processId = await getProcessId(db);
+
+        // Get checkpoint
+        let checkpoint = await getCheckpoint(db, processId);
+        logger.info(`Starting from checkpoint: ${JSON.stringify(checkpoint)}`);
+
+        // Get pending batches
+        const pendingBatches = await getPendingBatches(db, checkpoint.lastProcessedId);
+        logger.info(`Found ${pendingBatches.length} pending batches`);
+
+        for (const batch of pendingBatches) {
+            // Check timeout
+            if (Date.now() - startTime > timeLimit) {
+                logger.info(`Approaching timeout, saving checkpoint for process ${processId}`);
+                await saveCheckpoint(db, checkpoint, processId);
+                return {
+                    status: 'timeout',
+                    message: 'Process will continue from checkpoint',
+                    processedCount: checkpoint.processedCount,
+                    processId: processId
+                };
             }
-        };
-    } finally {
-        if (client) {
-            await client.close();
-            console.log('[RetrieveEmbed] MongoDB connection closed');
+
+            checkpoint = await processBatch(db, batch._id, checkpoint, processId);
         }
+
+        // Clear checkpoint if all batches are processed
+        await db.collection('AI_TEMP').deleteOne({
+            type: 'retrieve_checkpoint',
+            processId: processId
+        });
+        logger.info(`All batches processed successfully for process ${processId}`);
+
+        return {
+            status: 'success',
+            message: 'All batches processed',
+            processedCount: checkpoint.processedCount,
+            processId: processId
+        };
+
+    } catch (error) {
+        logger.error(`Error processing batches for process ${processId}:`, error);
+        throw error;
+    } finally {
+        await client.close();
+    }
+}
+
+// Digital Ocean Functions entry point
+export async function main(req, res) {
+    try {
+        const result = await retrieveEmbed();
+        res.status(200).json(result);
+    } catch (error) {
+        logger.error('Function execution failed:', error);
+        res.status(500).json({
+            error: error.message,
+            processId: processId // Note: This will be undefined if main() failed before setting processId
+        });
     }
 }

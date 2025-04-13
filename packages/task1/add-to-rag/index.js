@@ -1,283 +1,351 @@
 import { MongoClient } from 'mongodb';
-import weaviate from 'weaviate-ts-client';
+import { WeaviateClient } from 'weaviate-ts-client';
+import { v4 as uuidv4 } from 'uuid';
+import winston from 'winston';
 
-/**
- * AddToRAG - Inserts data from MongoDB Collection3 [AI_FOR_RAG] into Weaviate vector DB
- */
-export async function main(params) {    // Configuration
-    const config = {
-        mongoUri: process.env.MONGO_URI,
-        weaviateScheme: process.env.WEAVIATE_SCHEME || 'https',
-        weaviateHost: process.env.WEAVIATE_HOST,
-        weaviateApiKey: process.env.WEAVIATE_API_KEY,
-        processLimit: parseInt(process.env.PROCESS_LIMIT || '100'), // Max documents to process in one run
-        retryAttempts: parseInt(process.env.RETRY_ATTEMPTS || '3'),
-        retryDelay: parseInt(process.env.RETRY_DELAY || '1000') // ms
+// Configure logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console()
+    ]
+});
+
+// Constants
+const timeLimit = 850000; // 850 seconds (14min 10sec) to leave buffer before the 15min limit
+const MAX_DOCUMENTS_PER_BATCH = 20; // Reduced batch size to manage memory better
+const MAX_VECTORS_PER_REQUEST = 10; // Maximum vectors to process in one Weaviate request
+const CHECKPOINT_INTERVAL = 100; // Save checkpoint every 100 documents
+
+// Collection mapping
+const COLLECTION_MAPPING = {
+    'website_structure': 'WebsiteStructure',
+    'script_example': 'ScriptExample',
+    'sdk_documentation': 'SDKDocumentation'
+};
+
+// Configuration
+const config = {
+    // MongoDB configuration
+    mongoUri: process.env.MONGO_URI,
+    databaseName: process.env.DB_NAME || 'CORE_POC_DEV',
+
+    // Weaviate configuration
+    weaviateUrl: process.env.WEAVIATE_URL,
+    weaviateApiKey: process.env.WEAVIATE_API_KEY,
+    weaviateCluster: process.env.WEAVIATE_CLUSTER || 'ladeston-core-cluster',
+
+    // Process ID (from args or generate new one)
+    processId: process.env.PROCESS_ID
+};
+
+// Initialize Weaviate client
+const weaviateClient = new WeaviateClient({
+    scheme: 'https',
+    host: config.weaviateUrl,
+    apiKey: config.weaviateApiKey,
+    headers: {
+        'X-OpenAI-Api-Key': config.openAiApiKey
+    }
+});
+
+async function getLastUnfinishedProcessId(db) {
+    const lastProcess = await db.collection('AI_TEMP')
+        .findOne(
+            {
+                type: 'rag_checkpoint',
+                processedCount: { $exists: true } // Ensure it's a process that has started
+            },
+            { sort: { timestamp: -1 } }
+        );
+
+    if (lastProcess) {
+        logger.info(`Found last unfinished process ID: ${lastProcess.processId}`);
+        return lastProcess.processId;
+    }
+
+    return null;
+}
+
+async function getProcessId(db) {
+    // First try to use the process ID from environment variable
+    if (config.processId) {
+        logger.info(`Using process ID from environment: ${config.processId}`);
+        return config.processId;
+    }
+
+    // If no process ID in env, try to get the last unfinished process
+    const lastProcessId = await getLastUnfinishedProcessId(db);
+    if (lastProcessId) {
+        return lastProcessId;
+    }
+
+    // If no unfinished process exists, create a new one
+    const newProcessId = `rag-process-${uuidv4()}`;
+    logger.info(`No previous process found, created new process ID: ${newProcessId}`);
+    return newProcessId;
+}
+
+async function getCheckpoint(db, processId) {
+    const checkpoint = await db.collection('AI_TEMP').findOne({
+        type: 'rag_checkpoint',
+        processId: processId
+    });
+    return checkpoint || {
+        lastProcessedId: null,
+        processedCount: 0,
+        lastSource: null,
+        lastDataType: null
     };
+}
 
-    // Collection mappings
-    const collectionMappings = {
-        'website_structure': 'WebsiteStructure',
-        'script_example': 'ScriptExample',
-        'sdk_documentation': 'SDKDocumentation'
-    };
+async function saveCheckpoint(db, checkpoint, processId) {
+    await db.collection('AI_TEMP').updateOne(
+        {
+            type: 'rag_checkpoint',
+            processId: processId
+        },
+        {
+            $set: {
+                ...checkpoint,
+                timestamp: new Date(),
+                processId: processId
+            }
+        },
+        { upsert: true }
+    );
+}
 
-    let client = null;
-    let weaviateClient = null;
+async function getPendingDocuments(db, lastProcessedId, limit) {
+    const query = lastProcessedId
+        ? { _id: { $gt: lastProcessedId } }
+        : {};
 
-    // Stats tracking
-    const stats = {
-        processed: 0,
-        failed: 0,
-        signalsSent: 0,
-        sourceStats: {}
-    };
+    return await db.collection('AI_FOR_RAG')
+        .find({
+            ...query,
+            'properties.rag_timestamp': null
+        })
+        .sort({ _id: 1 })
+        .limit(limit)
+        .toArray();
+}
 
-    try {
-        // Connect to MongoDB
-        client = new MongoClient(config.mongoUri);
+async function updateRagTimestamp(db, documentId, timestamp) {
+    await db.collection('AI_FOR_RAG').updateOne(
+        { _id: documentId },
+        { $set: { 'properties.rag_timestamp': timestamp } }
+    );
+}
 
-        await client.connect();
-        console.log('[AddToRAG] Connected to MongoDB');
+async function createWeaviateObjects(documents) {
+    const results = [];
+    const batches = [];
 
-        // Initialize Weaviate client
-        weaviateClient = weaviate.client({
-            scheme: config.weaviateScheme,
-            host: config.weaviateHost,
-            apiKey: new weaviate.ApiKey(config.weaviateApiKey)
+    // Group documents by collection type
+    for (const doc of documents) {
+        const collectionName = COLLECTION_MAPPING[doc.properties.metadata.data_type];
+        if (!collectionName) {
+            throw new Error(`Unknown data type: ${doc.properties.metadata.data_type}`);
+        }
+
+        if (!batches[collectionName]) {
+            batches[collectionName] = [];
+        }
+        batches[collectionName].push(doc);
+    }
+
+    // Process each collection type
+    for (const [collectionName, docs] of Object.entries(batches)) {
+        // Split into smaller batches for memory management
+        for (let i = 0; i < docs.length; i += MAX_VECTORS_PER_REQUEST) {
+            const batch = docs.slice(i, i + MAX_VECTORS_PER_REQUEST);
+            const batchResults = await Promise.all(
+                batch.map(async (doc) => {
+                    const dataObject = {
+                        chunk_id: doc.properties.chunk_id,
+                        page_counter: doc.properties.page_counter,
+                        source: doc.properties.source,
+                        rag_timestamp: new Date().toISOString(),
+                        html_content: doc.properties.html_content,
+                        metadata_data_type: doc.properties.metadata.data_type,
+                        metadata_timestamp: doc.properties.metadata.timestamp,
+                        metadata_crawl_depth: doc.properties.metadata.crawl_depth,
+                        metadata_title: doc.properties.metadata.title
+                    };
+
+                    try {
+                        await weaviateClient.data
+                            .creator()
+                            .withClassName(collectionName)
+                            .withProperties(dataObject)
+                            .withVector(doc.vector)
+                            .withId(doc.id)
+                            .do();
+
+                        logger.info(`Inserted document ${doc.id} into Weaviate collection ${collectionName}`);
+                        return { success: true, doc };
+                    } catch (error) {
+                        logger.error(`Failed to insert document ${doc.id} into Weaviate:`, error);
+                        return { success: false, doc, error };
+                    }
+                })
+            );
+            results.push(...batchResults);
+        }
+    }
+
+    return results;
+}
+
+async function checkLastDocumentForSource(db, source) {
+    const lastDocument = await db.collection('AI_FOR_RAG')
+        .findOne(
+            { 'properties.source': source },
+            { sort: { 'properties.page_counter': -1, 'properties.chunk_id': -1 } }
+        );
+
+    const pendingDocuments = await db.collection('AI_FOR_RAG')
+        .countDocuments({
+            'properties.source': source,
+            'properties.rag_timestamp': null
         });
 
-        // Test Weaviate connection
-        await weaviateClient.schema.getter().do();
-        console.log('[AddToRAG] Connected to Weaviate');
+    return {
+        isLastDocument: lastDocument && pendingDocuments === 0,
+        dataType: lastDocument?.properties?.metadata?.data_type
+    };
+}
 
-        const db = client.db();
-        const forRagCollection = db.collection('AI_FOR_RAG');
-        const signalRagCollection = db.collection('SIGNAL_RAG');
+async function createSignalRag(db, source, dataType) {
+    const collectionName = COLLECTION_MAPPING[dataType];
+    if (!collectionName) {
+        throw new Error(`Unknown data type: ${dataType}`);
+    }
 
-        // Find documents in AI_FOR_RAG without a timestamp
-        const docsToImportCount = await forRagCollection.countDocuments({ 'properties.rag_timestamp': null });
+    await db.collection('SIGNAL_RAG').insertOne({
+        source,
+        collection: collectionName,
+        timestamp: new Date()
+    });
 
-        if (docsToImportCount === 0) {
-            console.log('[AddToRAG] No documents to import to Weaviate');
-            return {
-                success: true,
-                message: 'No documents to import',
-                stats
-            };
+    logger.info(`Created signal for source ${source} in collection ${collectionName}`);
+}
+
+async function processDocuments(db) {
+    // Get process ID based on priority
+    const processId = await getProcessId(db);
+
+    let checkpoint = await getCheckpoint(db, processId);
+    logger.info(`Starting from checkpoint: ${JSON.stringify(checkpoint)}`);
+
+    const startTime = Date.now();
+    let currentSource = null;
+
+    while (true) {
+        // Check time limit
+        if (Date.now() - startTime > timeLimit) {
+            logger.info(`Approaching time limit for process ${processId}`);
+            await saveCheckpoint(db, checkpoint, processId);
+            return checkpoint.processedCount;
         }
 
-        console.log(`[AddToRAG] Found ${docsToImportCount} documents to import to Weaviate (processing up to ${config.processLimit})`);
-
-        // Get documents to import with a limit
-        const docsToImport = await forRagCollection
-            .find({ 'properties.rag_timestamp': null })
-            .limit(config.processLimit)
-            .toArray();
-
-        // Group documents by source and data type for tracking
-        const docsBySource = {};
-        const sourceTotal = {};
-
-        for (const doc of docsToImport) {
-            const source = doc.properties.source;
-            const dataType = doc.properties.metadata.data_type;
-
-            if (!docsBySource[source]) {
-                docsBySource[source] = {};
-                sourceTotal[source] = await forRagCollection.countDocuments({ 'properties.source': source });
-
-                stats.sourceStats[source] = {
-                    total: sourceTotal[source],
-                    processed: 0,
-                    failed: 0,
-                    completed: false
-                };
-            }
-
-            if (!docsBySource[source][dataType]) {
-                docsBySource[source][dataType] = [];
-            }
-
-            docsBySource[source][dataType].push(doc);
+        // Get next batch of documents
+        const documents = await getPendingDocuments(db, checkpoint.lastProcessedId, MAX_DOCUMENTS_PER_BATCH);
+        if (documents.length === 0) {
+            break;
         }
 
-        // Process documents by source and data type
-        const sources = Object.keys(docsBySource);
+        logger.info(`Processing batch of ${documents.length} documents for process ${processId}`);
 
-        for (const source of sources) {
-            console.log(`[AddToRAG] Processing source: ${source}`);
+        // Process documents in smaller batches for Weaviate
+        const results = await createWeaviateObjects(documents);
 
-            const dataTypes = Object.keys(docsBySource[source]);
+        // Update MongoDB and handle signals
+        for (const result of results) {
+            if (result.success) {
+                const doc = result.doc;
 
-            for (const dataType of dataTypes) {
-                // Map dataType to Weaviate collection
-                const weaviateCollection = collectionMappings[dataType];
-
-                if (!weaviateCollection) {
-                    console.error(`[AddToRAG] Unknown data_type: ${dataType} for source ${source}`);
-                    continue;
+                // Check if we're starting a new source
+                if (currentSource !== doc.properties.source) {
+                    currentSource = doc.properties.source;
+                    logger.info(`Processing documents for source: ${currentSource}`);
                 }
 
-                console.log(`[AddToRAG] Processing data type: ${dataType} => ${weaviateCollection}`);
+                // Update timestamp in MongoDB
+                const timestamp = new Date();
+                await updateRagTimestamp(db, doc._id, timestamp);
 
-                const docs = docsBySource[source][dataType];
+                // Update checkpoint
+                checkpoint.lastProcessedId = doc._id;
+                checkpoint.processedCount++;
+                checkpoint.lastSource = doc.properties.source;
+                checkpoint.lastDataType = doc.properties.metadata.data_type;
 
-                // Check if Weaviate collection exists and create schema if not
-                try {
-                    const schemaRes = await weaviateClient.schema.getter().do();
-                    const collectionExists = schemaRes.classes && schemaRes.classes.some(c => c.class === weaviateCollection);
-
-                    if (!collectionExists) {
-                        console.log(`[AddToRAG] Creating schema for collection ${weaviateCollection}`);
-
-                        // Create schema based on collection type
-                        const schemaDefinition = {
-                            class: weaviateCollection,
-                            description: `A chunk of ${dataType.replace('_', ' ')} including vector and metadata for RAG`,
-                            vectorizer: 'none',
-                            properties: [
-                                {name: 'chunk_id', dataType: ['int']},
-                                {name: 'page_counter', dataType: ['int']},
-                                {name: 'source', dataType: ['text']},
-                                {name: 'rag_timestamp', dataType: ['date']},
-                                {name: 'html_content', dataType: ['text']},
-                                {name: 'metadata_data_type', dataType: ['text']},
-                                {name: 'metadata_timestamp', dataType: ['date']},
-                                {name: 'metadata_crawl_depth', dataType: ['int']},
-                                {name: 'metadata_title', dataType: ['text']}
-                            ]
-                        };
-
-                        await weaviateClient.schema.classCreator().withClass(schemaDefinition).do();
-                        console.log(`[AddToRAG] Created schema for collection ${weaviateCollection}`);
-                    }
-                } catch (error) {
-                    console.error(`[AddToRAG] Error checking/creating schema for ${weaviateCollection}:`, error.message);
-                    continue;
+                // Save checkpoint periodically
+                if (checkpoint.processedCount % CHECKPOINT_INTERVAL === 0) {
+                    await saveCheckpoint(db, checkpoint, processId);
+                    logger.info(`Saved checkpoint at ${checkpoint.processedCount} documents`);
                 }
 
-                // Process each document individually
-                for (const doc of docs) {
-                    try {
-                        // Prepare data object for Weaviate
-                        const weaviateObj = {
-                            chunk_id: doc.properties.chunk_id,
-                            page_counter: doc.properties.page_counter,
-                            source: doc.properties.source,
-                            rag_timestamp: new Date().toISOString(),
-                            html_content: doc.properties.html_content,
-                            metadata_data_type: doc.properties.metadata.data_type,
-                            metadata_timestamp: doc.properties.metadata.timestamp,
-                            metadata_crawl_depth: doc.properties.metadata.crawl_depth,
-                            metadata_title: doc.properties.metadata.title
-                        };
-
-                        // Try to insert into Weaviate with retries
-                        let success = false;
-                        let attempts = 0;
-
-                        while (!success && attempts < config.retryAttempts) {
-                            attempts++;
-                            try {
-                                // Insert into Weaviate
-                                await weaviateClient.data
-                                    .creator()
-                                    .withClassName(weaviateCollection)
-                                    .withId(doc.id)
-                                    .withProperties(weaviateObj)
-                                    .withVector(doc.vector)
-                                    .do();
-
-                                success = true;
-
-                                // Update timestamp in AI_FOR_RAG
-                                await forRagCollection.updateOne(
-                                    { id: doc.id },
-                                    { $set: { 'properties.rag_timestamp': new Date() } }
-                                );
-
-                                // Update stats
-                                stats.processed++;
-                                stats.sourceStats[source].processed++;
-
-                                console.log(`[AddToRAG] Inserted document ${doc.id} into Weaviate collection ${weaviateCollection}`);
-                            } catch (error) {
-                                console.error(`[AddToRAG] Error inserting document ${doc.id} into Weaviate (attempt ${attempts}):`, error.message);
-
-                                if (attempts < config.retryAttempts) {
-                                    const backoffTime = config.retryDelay * Math.pow(2, attempts - 1);
-                                    console.warn(`[AddToRAG] Retrying in ${backoffTime}ms (attempt ${attempts + 1}/${config.retryAttempts})`);
-                                    await new Promise(resolve => setTimeout(resolve, backoffTime));
-                                } else {
-                                    console.error(`[AddToRAG] Failed to insert document ${doc.id} after ${config.retryAttempts} attempts`);
-                                    stats.failed++;
-                                    stats.sourceStats[source].failed++;
-                                }
-                            }
-                        }
-                    } catch (error) {
-                        console.error(`[AddToRAG] Error processing document ${doc.id}:`, error.message);
-                        stats.failed++;
-                        stats.sourceStats[source].failed++;
-                    }
+                // Check if this is the last document for this source
+                const { isLastDocument, dataType } = await checkLastDocumentForSource(db, currentSource);
+                if (isLastDocument) {
+                    await createSignalRag(db, currentSource, dataType);
                 }
-            }
-
-            // Check if all documents for this source have been processed
-            const remaining = await forRagCollection.countDocuments({
-                'properties.source': source,
-                'properties.rag_timestamp': null
-            });
-
-            // If no remaining documents, insert signal in SIGNAL_RAG
-            if (remaining === 0) {
-                console.log(`[AddToRAG] All documents for source ${source} have been processed`);
-                stats.sourceStats[source].completed = true;
-
-                // Determine the collection based on the most common data type for this source
-                let primaryCollection = '';
-                let maxCount = 0;
-
-                for (const dataType of Object.keys(docsBySource[source])) {
-                    const count = docsBySource[source][dataType].length;
-                    if (count > maxCount) {
-                        maxCount = count;
-                        primaryCollection = collectionMappings[dataType];
-                    }
-                }
-
-                // Insert signal in SIGNAL_RAG
-                await signalRagCollection.insertOne({
-                    source: source,
-                    collection: primaryCollection,
-                    timestamp: new Date()
-                });
-
-                stats.signalsSent++;
-                console.log(`[AddToRAG] Inserted signal in SIGNAL_RAG for source ${source} with collection ${primaryCollection}`);
             } else {
-                console.log(`[AddToRAG] ${remaining} documents remaining for source ${source}`);
+                logger.error(`Failed to process document ${result.doc.id}:`, result.error);
             }
         }
+    }
+
+    // Clear checkpoint if all documents are processed
+    await db.collection('AI_TEMP').deleteOne({
+        type: 'rag_checkpoint',
+        processId: processId
+    });
+
+    return checkpoint.processedCount;
+}
+
+async function addToRAG() {
+    const client = new MongoClient(config.mongoUri);
+
+    try {
+        await client.connect();
+        const db = client.db(config.databaseName);
+
+        const processedCount = await processDocuments(db);
 
         return {
-            success: true,
-            message: `Imported ${stats.processed} documents to Weaviate (${stats.failed} failed, ${stats.signalsSent} signals sent)`,
-            stats
+            status: 'success',
+            message: 'All documents processed',
+            processedCount,
+            processId: config.processId
         };
+
     } catch (error) {
-        console.error('[AddToRAG] Fatal error:', error);
-        return {
-            success: false,
-            error: error.message,
-            stack: error.stack,
-            stats
-        };
+        logger.error(`Error processing documents for process ${config.processId}:`, error);
+        throw error;
     } finally {
-        if (client) {
-            await client.close();
-            console.log('[AddToRAG] MongoDB connection closed');
-        }
+        await client.close();
+    }
+}
+
+// Digital Ocean Functions entry point
+export async function main(req, res) {
+    try {
+        const result = await addToRAG();
+        res.status(200).json(result);
+    } catch (error) {
+        logger.error('Function execution failed:', error);
+        res.status(500).json({
+            error: error.message,
+            processId: config.processId
+        });
     }
 }
