@@ -6,10 +6,10 @@ import { uploadFile, createBatch } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
 
-const MAX_JSONL_ROWS = 50_000;    // OpenAI hard limit per batch
+const MAX_EMBEDDINGS_PER_BATCH = 50_000;    // OpenAI hard limit per batch
 const SAFETY_WINDOW  = 20_000;    // ms before hardDeadline to exit loop
 const LOG_EVERY      = 1000;       // progress log cadence
-const BATCH_PER_REQ  = 16;
+const BATCH_PER_REQUEST  = 16;
 
 /**
  * DigitalOcean Functions entry‑point – Script‑1 (manual trigger)
@@ -67,10 +67,7 @@ export async function main(payload = {}, ctx = {}) {
 
         /* Stream chunks in deterministic order */
         const cursor = col.chunks
-            .find({
-                chunk_id: 1,
-                page_counter: 1,
-            }, {
+            .find({}, {
                 projection: {
                     html_content: 1,
                     chunk_id: 1,
@@ -118,7 +115,7 @@ export async function main(payload = {}, ctx = {}) {
             embeddingsCount += 1;
             chunkIds.push(vectorId);
 
-            if (reqRows.length === BATCH_PER_REQ) {
+            if (reqRows.length === BATCH_PER_REQUEST) {
                 flushEmbeddingsRequest();
                 reqRows.length = 0;
             }
@@ -130,7 +127,7 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
-            if (embeddingsCount >= MAX_JSONL_ROWS || nearTimeout) {
+            if (embeddingsCount >= MAX_EMBEDDINGS_PER_BATCH || nearTimeout) {
                 flushEmbeddingsRequest();
                 await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
                 jsonlRows.length = 0;
