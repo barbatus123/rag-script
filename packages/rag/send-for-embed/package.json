@@ -1,0 +1,20 @@
+{
+  "name": "rag-script-function-1",
+  "version": "1.0.0",
+  "description": "Task 1 RAG script 1",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "axios-retry": "^3.8.0",
+    "form-data": "^4.0.0",
+    "mongodb": "^6.4.0",
+    "pino": "^8.21.0",
+    "pino-pretty": "^10.2.0",
+    "split2": "^4.1.0",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

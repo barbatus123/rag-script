@@ -3,27 +3,23 @@ environment:
   OPENAI_API_KEY: ""
   MONGO_URI: ""
 packages:
-    - name: task1
-      shared: false
-      environment: {}
-      parameters: {}
-      annotations: {}
-      functions:
-        - name: send-for-embed
-          runtime: nodejs:default
-          limits:
-            timeout: 850000  # Increase to 5 minutes (300000ms)
-            memory: 512
-        - name: retrieve-embed
-          runtime: nodejs:default
-          limits:
-            timeout: 850000  # Increase to 5 minutes (300000ms)
-            memory: 512
-        - name: add-to-rag
-          runtime: nodejs:default
-          limits:
-            timeout: 850000  # Increase to 5 minutes (300000ms)
-            memory: 512
-          environment:
-            WEAVIATE_API_KEY: ""
-            WEAVIATE_API_HOST: ""
+  - name: rag
+    shared: false
+    environment:
+      LOG_LEVEL: warn
+    parameters: {}
+    annotations: {}
+    functions:
+      - name: send-for-embed
+        runtime: nodejs:18
+        limits:
+           timeout: 850000
+           memory: 512
+      - name: retrieve-embed
+        runtime: nodejs:18
+        limits:
+          timeout: 850000
+          memory: 512
+        environment:
+          WEAVIATE_API_KEY: ""
+          WEAVIATE_API_HOST: ""
