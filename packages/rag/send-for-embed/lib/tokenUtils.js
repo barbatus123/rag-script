@@ -20,7 +20,6 @@ export function countTokens(text = '') {
 }
 
 export function trimTokens(text, maxTokens = 512) {
-    // Use tiktoken to truncate text to maxTokens
     const tokens = enc.encode(text);
     if (tokens.length <= maxTokens) {
         return { text, tokens: tokens.length };
