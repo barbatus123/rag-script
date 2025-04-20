@@ -20,9 +20,9 @@ export async function main(payload = {}, ctx = {}) {
     try {
         // ── Init DB & Weaviate ─────────────────────────────────────
         const client = await getMongo();
-        const db     = client.db(config.databaseName);
-        const col    = collections(db);
-        const wv     = getWeaviate();
+        const db = client.db(config.databaseName);
+        const col = collections(db);
+        const wv = getWeaviate();
 
         // ── Find pending chunks and batches to process ────
         const pendingChunks = await col.embIndex.find({ timestamp: null }).toArray();
@@ -54,22 +54,22 @@ export async function main(payload = {}, ctx = {}) {
                 logger.warn({ batchId, status: status.status }, 'batch not ready');
                 continue;
             }
-
             try {
                 let  errorStream = await downloadFile(status.error_file_id);
+                const failedVectorIds = [];
                 await pipeline(
                     errorStream,
                     split2(JSON.parse),
                     async function (source) {
                         for await (const row of source) {
-                            const custom_id = row.custom_id;
-                            const vectorIds = custom_id.split(',');
-                            col.embIndex.updateMany(
-                                { chunk_id: { $in: vectorIds } },
-                                { $set: { batch_id: null } }
-                            );
+                            failedVectorIds.push(row.custom_id);
                         }
                     }
+                );
+
+                await col.embIndex.updateMany(
+                    { chunk_id: { $in: failedVectorIds } },
+                    { $set: { batch_id: null } }
                 );
             } catch (err) {}
 
@@ -96,46 +96,43 @@ export async function main(payload = {}, ctx = {}) {
                 return chunks;
             }
 
-            const weaviateObjects = [];
-            const vectorIdByUUID = {};
+            const chunkEmbeddings = [];
             await pipeline(
                 outStream,
                 split2(JSON.parse),
                 async function (source) {
                     for await (const row of source) {
-                        const custom_id = row.custom_id;
-                        const vectorIds = custom_id.split(',');
-                        const embeddings = row.response.body.data;
-                        const chunks = await loadChunks(vectorIds);
-                        const nowISO = new Date().toISOString();
-        
-                        let count = 0;
-                        for (const chunk of chunks) {
-                            const id = uuidv4();
-                            vectorIdByUUID[id] = vectorIds[count];
-                            weaviateObjects.push({
-                                class: mapClass(chunk.metadata.data_type),
-                                id,
-                                vector: embeddings[count].embedding,
-                                properties: {
-                                    chunk_id: chunk.chunk_id,
-                                    page_counter: chunk.page_counter,
-                                    source: chunk.source,
-                                    html_content: chunk.html_content,
-                                    rag_timestamp: nowISO,
-                                    metadata_data_type: chunk.metadata.data_type,
-                                    metadata_timestamp: chunk.metadata.timestamp,
-                                    metadata_crawl_depth: chunk.metadata.crawl_depth,
-                                    metadata_title: chunk.metadata.title,
-                                }
-                            });
-                            count++;
-                            processedSources.add(chunk.source);
-                        
-                        }
+                        chunkEmbeddings.push({
+                            vectorId: row.custom_id,
+                            embedding: row.response.body.data[0].embedding
+                        });
                     }
                 }
             );
+
+            const vectorIdByUUID = {};
+            const chunks = await loadChunks(chunkEmbeddings.map(chunk => chunk.vectorId));
+            const weaviateObjects = chunks.map((chunk, index) => {
+                const id = uuidv4();
+                vectorIdByUUID[id] = chunkEmbeddings[index].vectorId;
+                processedSources.add(chunk.source);
+                return {
+                    class: mapClass(chunk.metadata.data_type),
+                    id,
+                    vector: chunkEmbeddings[index].embedding,
+                    properties: {
+                        chunk_id: chunk.chunk_id,
+                        page_counter: chunk.page_counter,
+                        source: chunk.source,
+                        html_content: chunk.html_content,
+                        rag_timestamp: new Date(),
+                        metadata_data_type: chunk.metadata.data_type,
+                        metadata_timestamp: chunk.metadata.timestamp,
+                        metadata_crawl_depth: chunk.metadata.crawl_depth,
+                        metadata_title: chunk.metadata.title,
+                    }
+                };
+            });
 
             const doneVectorIds = [];
             for (let i = 0; i < weaviateObjects.length; i += 1000) {
@@ -158,8 +155,9 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             processedBatches++;
-            logger.warn({ batchId, processedBatches }, 'batch processed fully');
         }
+
+        logger.warn({ processedBatches }, 'batch processed fully');
 
         for (const src of processedSources) {
             const totalChunks = await col.chunks.countDocuments({ source: src });
