@@ -5,6 +5,7 @@ import { batchStatus, downloadFile } from './lib/openai.js';
 import { getWeaviate, mapClass }   from './lib/weaviate.js';
 import { pipeline }                from 'stream/promises';
 import split2                      from 'split2';
+import { v4 as uuidv4 }            from 'uuid';
 
 const SAFETY_WINDOW = 10_000;   // ms before the 850s timeout
 
@@ -13,6 +14,9 @@ export async function main(payload = {}, ctx = {}) {
     const hardDeadline = start + 850_000;
     logger.info({ processId: config.processId }, 'retrieveEmbed started');
 
+    // collect all sources touched in this batch
+    const processedSources = new Set();
+
     try {
         // ── Init DB & Weaviate ─────────────────────────────────────
         const client = await getMongo();
@@ -20,21 +24,18 @@ export async function main(payload = {}, ctx = {}) {
         const col    = collections(db);
         const wv     = getWeaviate();
 
-        // ── Find all batches still pending (timestamp === null) ────
-        const pendingBatches = await col.embIndex.distinct(
-            'batch_id',
-            { timestamp: null }
-        );
-        logger.warn({ pendingCount: pendingBatches.length }, 'pending batches found');
+        // ── Find pending chunks and batches to process ────
+        const pendingChunks = await col.embIndex.find({ timestamp: null }).toArray();
+        const pendingBatches = new Set(pendingChunks.map(chunk => chunk.batch_id));
+        logger.warn({ pendingCount: pendingBatches.size }, 'pending batches found');
 
-        if (pendingBatches.length === 0) {
+        if (pendingBatches.size === 0) {
             return { statusCode: 200, body: 'No pending batches' };
         }
 
         let processedBatches = 0;
-
         for (const batchId of pendingBatches) {
-            // bail early if we’re almost out of time
+            // bail early if we're almost out of time
             if (Date.now() >= hardDeadline - SAFETY_WINDOW) {
                 logger.warn('Approaching timeout - exiting loop early');
                 break;
@@ -64,8 +65,20 @@ export async function main(payload = {}, ctx = {}) {
 
             logger.warn({ batchId }, 'processing completed batch');
 
-            // collect all sources touched in this batch
-            const processedSources = new Set();
+            async function loadChunks(vectorIds) {
+                const queries = vectorIds.map(vectorId => {
+                    const [source, rest]   = vectorId.split('__p');
+                    const [pageStr, cid]   = rest.split('__c');
+                    const page_counter     = parseInt(pageStr, 10);
+                    const chunk_id         = parseInt(cid, 10);
+                    return { source, page_counter, chunk_id };
+                });
+                const chunks = await col.chunks.find({ $or: queries }).toArray();
+                return chunks;
+            }
+
+            const objects = [];
+            const vectorIdByUUID = {};
 
             // ── Stream, insert into Weaviate + AI_FOR_RAG ───────────
             await pipeline(
@@ -73,85 +86,77 @@ export async function main(payload = {}, ctx = {}) {
                 split2(JSON.parse),
                 async function (source) {
                     for await (const row of source) {
-                        const vectorId = row.id;
-                        const embedding= row.embedding;
-
-                        // parse vectorId → { source, page_counter, chunk_id }
-                        const [src, rest]      = vectorId.split('__p');
-                        const [pageStr, cid]   = rest.split('__c');
-                        const page_counter     = parseInt(pageStr, 10);
-                        const chunk_id         = parseInt(cid, 10);
-
-                        const chunk = await col.chunks.findOne({
-                            source, page_counter, chunk_id
-                        }.source ? { source: src, page_counter, chunk_id } : {});
-                        if (!chunk) {
-                            logger.warn({ vectorId }, 'chunk not found');
-                            continue;
-                        }
-
-                        processedSources.add(src);
-
-                        const className = mapClass(chunk.metadata.data_type);
-
-                        // upsert into Weaviate
-                        try {
-                            await wv.data
-                                .creator()
-                                .withClassName(className)
-                                .withId(vectorId)
-                                .withProperties({
-                                    chunk_id:             chunk.chunk_id,
-                                    page_counter:         chunk.page_counter,
-                                    source:               chunk.source,
-                                    rag_timestamp:        new Date().toISOString(),
-                                    html_content:         chunk.html_content,
-                                    metadata_data_type:   chunk.metadata.data_type,
-                                    metadata_timestamp:   chunk.metadata.timestamp,
+                        const custom_id = row.custom_id;
+                        const vectorIds = custom_id.split('-');
+                        const embeddings = row.response.body.data;
+                        const chunks = await loadChunks(vectorIds);
+                        const nowISO = new Date().toISOString();
+        
+                        let count = 0;
+                        for (const chunk of chunks) {
+                            const id = uuidv4();
+                            vectorIdByUUID[id] = vectorIds[count];
+                            objects.push({
+                                class: mapClass(chunk.metadata.data_type),
+                                id,
+                                vector: embeddings[count].embedding,
+                                properties: {
+                                    chunk_id: chunk.chunk_id,
+                                    page_counter: chunk.page_counter,
+                                    source: chunk.source,
+                                    html_content: chunk.html_content,
+                                    rag_timestamp: nowISO,
+                                    metadata_data_type: chunk.metadata.data_type,
+                                    metadata_timestamp: chunk.metadata.timestamp,
                                     metadata_crawl_depth: chunk.metadata.crawl_depth,
-                                    metadata_title:       chunk.metadata.title
-                                })
-                                .withVector(embedding)
-                                .do();
-                        } catch (err) {
-                            logger.error({ err, vectorId }, 'Weaviate insert failed');
-                            continue;
+                                    metadata_title: chunk.metadata.title,
+                                }
+                            });
+                            count++;
+                            processedSources.add(chunk.source);
                         }
-
-                        // record in AI_FOR_RAG
-                        await col.ragReady.updateOne(
-                            { chunk_id: vectorId },
-                            { $set: { timestamp: new Date() } },
-                            { upsert: true }
-                        );
+                        console.log(objects.length);
                     }
                 }
             );
 
-            // ── Mark this batch done in AI_EMBEDDING ───────────────
-            await col.embIndex.updateMany(
-                { batch_id: batchId },
-                { $set: { timestamp: new Date() } }
-            );
-
-            // ── SIGNAL_RAG: for each source, if all chunks are done, upsert one doc ─
-            for (const src of processedSources) {
-                const totalChunks = await col.chunks.countDocuments({ source: src });
-                const doneChunks  = await col.ragReady.countDocuments({
-                    chunk_id: { $regex: `^${src}__` }
-                });
-                if (totalChunks === doneChunks) {
-                    await col.signal.updateOne(
-                        { source: src, collection: mapClass(/* pick any data_type if uniform */) },
-                        { $setOnInsert: { timestamp: null } },
-                        { upsert: true }
-                    );
-                    logger.info({ source: src }, 'SIGNAL_RAG doc upserted');
+            const doneVectorIds = [];
+            for (let i = 0; i < objects.length; i += 1000) {
+                const batch = objects.slice(i, i + 1000);
+                const responses = await wv.batch.objectsBatcher().withObjects(batch).do();
+                for (const response of responses) {
+                    if (response.result.status === 'SUCCESS') {
+                        doneVectorIds.push(vectorIdByUUID[response.id]);
+                    }
                 }
+                await col.ragReady.updateMany(
+                    { chunk_id: { $in: doneVectorIds } },
+                    { $set: { timestamp: new Date() } },
+                    { upsert: true }
+                );
+                await col.embIndex.updateMany(
+                    { chunk_id: { $in: doneVectorIds } },
+                    { $set: { timestamp: new Date() } }
+                );
             }
 
             processedBatches++;
             logger.warn({ batchId, processedBatches }, 'batch processed fully');
+        }
+
+        for (const src of processedSources) {
+            const totalChunks = await col.chunks.countDocuments({ source: src });
+            const doneChunks  = await col.ragReady.countDocuments({
+                chunk_id: { $regex: `^${src}__` }
+            });
+            if (totalChunks === doneChunks) {
+                await col.signal.updateOne(
+                    { source: src, collection: mapClass(/* pick any data_type if uniform */) },
+                    { $setOnInsert: { timestamp: new Date() } },
+                    { upsert: true }
+                );
+                logger.info({ source: src }, 'SIGNAL_RAG doc upserted');
+            }
         }
 
         const duration = ((Date.now() - start) / 1000).toFixed(1) + 's';
