@@ -14,16 +14,15 @@ const LOG_EVERY      = 1000;       // progress log cadence
  */
 
 export async function main(payload = {}, ctx = {}) {
-    const started      = Date.now();
-    const hardDeadline = started + 850_000;          // 850 s (leave 50 s spare)
-
+    const start        = Date.now();
+    const hardDeadline = start + 850_000;
     const rateLimiter  = new RateLimiter(config.openAiRateLimit);
     const progress     = new ProgressTracker(config.processId);
 
     logger.info({ processId: config.processId }, 'sendForEmbed started');
 
     try {
-        /* ── Connect to Mongo ─────────────────────────────────────────────── */
+        // ── Setup Mongo & Collections ───────────────────────────────────
         const client = await getMongo();
         const db     = client.db(config.databaseName);
         const col    = collections(db);
@@ -40,7 +39,7 @@ export async function main(payload = {}, ctx = {}) {
         const shouldClean = payload?.clean === true;
 
         if (shouldClean) {
-            logger.warn('🧹 Clean flag detected – purging previous embeddings …');
+            logger.warn('Clean flag detected – purging previous embeddings …');
             await Promise.all([
                 col.embIndex.deleteMany({}),
                 col.ragReady.deleteMany({}),
@@ -50,10 +49,11 @@ export async function main(payload = {}, ctx = {}) {
             logger.warn('Cleanup complete; continuing with fresh run.');
         }
 
-        /* ── Skip set: only fully‑processed chunks (timestamp≠null) ─────── */
+        // ── Build skip‑set (only fully‑completed chunks) ────────────────
         const completedSet = new Set(
             await col.embIndex.distinct('chunk_id', { timestamp: { $ne: null } })
         );
+        progress.metrics.totalChunks = await col.chunks.countDocuments();
 
         logger.warn(
             {
@@ -81,45 +81,62 @@ export async function main(payload = {}, ctx = {}) {
                 }
             });
 
-        let jsonlRows = [];
-        let chunkIds  = [];
-        let batchTokens = 0;
+        let jsonlRows     = [];
+        let chunkIds      = [];
+        let batchTokens   = 0;
+        // Load initial enqueued tokens (sum of token_count for pending chunks)
+        const agg = await col.embIndex.aggregate([
+            {$match: {timestamp: null}},
+            {$group: {_id: null, total: {$sum: '$token_count'}}}
+        ]).toArray();
+        let enqueuedTokens = agg.length > 0 ? agg[0].total : 0;
 
         while (await cursor.hasNext()) {
             const doc = await cursor.next();
             const vectorId = `${doc.source}__p${doc.page_counter}__c${doc.chunk_id}`;
 
+            // skip already done
             if (completedSet.has(vectorId)) {
                 progress.incrementMetric('skippedChunks');
                 continue;
             }
 
+            // enforce per‑chunk token limit only
             const tokens = countTokens(doc.html_content);
-            if (tokens > config.maxTokenPerBatch) {
+            if (tokens > config.maxTokenPerInput) {
                 logger.warn({vectorId, tokens}, 'Chunk too large – skipped');
                 progress.incrementMetric('skippedChunks');
                 continue;
             }
 
-            // If adding this chunk would exceed either the token or count limits, flush first
+            // decide if we need to flush before adding this chunk:
+            // 1) row‐count cap
+            // 2) per‐chunk too‐big guard is earlier
+            // 3) org‐level enqueued‐token cap
+            // 4) nearing timeout
+            const remainingOrg = config.orgTokenLimit - enqueuedTokens;
             const needFlush =
                 jsonlRows.length > 0 && (
-                    jsonlRows.length >= Math.min(config.batchSize, config.maxJsonlRows) ||
-                    batchTokens + tokens > config.maxTokenPerBatch ||
+                    jsonlRows.length >= config.batchSize ||
+                    batchTokens + tokens > remainingOrg ||
                     Date.now() >= hardDeadline - SAFETY_WINDOW
                 );
 
             if (needFlush) {
-                await flushBatch({jsonlRows, chunkIds, col, rateLimiter, progress});
-                jsonlRows = [];
-                chunkIds = [];
+                await flushBatch({ jsonlRows, chunkIds, batchTokens, col, rateLimiter, progress });
+                // update our in‐memory enqueued count
+                enqueuedTokens += batchTokens;
+
+                jsonlRows   = [];
+                chunkIds    = [];
                 batchTokens = 0;
                 if (Date.now() >= hardDeadline - SAFETY_WINDOW) {
-                    logger.warn('Safety window reached — exiting loop');
+                    logger.warn('Safety window reached – exiting loop');
                     break;
                 }
             }
 
+            // append the JSONL line
             jsonlRows.push(JSON.stringify({
                 custom_id: vectorId,
                 method: 'POST',
@@ -136,94 +153,86 @@ export async function main(payload = {}, ctx = {}) {
             progress.updateTokens(tokens);
             progress.incrementMetric('processedChunks');
             if (progress.metrics.processedChunks % LOG_EVERY === 0) {
-                logger.info({
-                    processed: progress.metrics.processedChunks,
-                    batchSize: jsonlRows.length,
-                    batchTokens
-                }, 'progress');
-            }
-
-
-            const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
-            if (jsonlRows.length >= config.maxJsonlRows || nearTimeout) {
-                await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
-                jsonlRows.length = 0;
-                chunkIds.length  = 0;
-                if (nearTimeout) break;      // exit loop safely
-            }
-
-            if (progress.metrics.processedChunks % LOG_EVERY === 0) {
-                logger.warn(
+                logger.info(
                     {
                         processed: progress.metrics.processedChunks,
-                        skipped:   progress.metrics.skippedChunks,
-                        alreadyFinished: completedSet.size
+                        batchSize: jsonlRows.length,
+                        batchTokens
                     },
-                    'in‑progress'
+                    'progress'
                 );
             }
         }
 
-        /* final flush */
+        // final flush if anything remains
         if (jsonlRows.length) {
-            await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
+            await flushBatch({ jsonlRows, chunkIds, batchTokens, col, rateLimiter, progress });
         }
 
-        const duration = ((Date.now() - started) / 1000).toFixed(1) + 's';
-        logger.warn({ duration, metrics: progress.metrics },
-            completedSet.size
-                ? 'sendForEmbed finished (resume run)'
-                : 'sendForEmbed finished (initial run)');
-
+        const duration = ((Date.now() - start)/1000).toFixed(1) + 's';
+        logger.info({ duration, metrics: progress.metrics }, 'sendForEmbed finished');
         return { statusCode: 200, body: JSON.stringify(progress.metrics) };
+
     } catch (err) {
         logger.error({ err }, 'sendForEmbed failed');
         return { statusCode: 500, body: err.message };
     }
 }
 
-/* ──────────────────────────────────────────────────────────────────────────
-   Flush the current batch
 
-   1. Upsert placeholder docs `{ timestamp: null }` so restarts can resume.
-   2. Create the OpenAI batch (rate‑limited).
-   3. Back‑fill `batch_id` for those same docs.
-─────────────────────────────────────────────────────────────────────────── */
-async function flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress }) {
+/**
+ * Flush the current JSONL batch:
+ * 1) Mark docs in AI_EMBEDDING
+ * 2) Upload file & create OpenAI batch
+ * 3) Back‑fill batch_id in AI_EMBEDDING
+ */
+async function flushBatch({ jsonlRows, chunkIds, batchTokens, col, rateLimiter, progress }) {
     if (!jsonlRows.length) return;
 
+    // 1️⃣ increment batch counter
     progress.incrementMetric('totalBatches');
 
-    /* 1️⃣  Mark chunks as in‑flight */
+    // compute an average token_count per chunk
+    const avgTokenCount = batchTokens / chunkIds.length;
+
+    // 2️⃣ mark chunks as in‐flight and record token_count
     await col.embIndex.bulkWrite(
         chunkIds.map(id => ({
             updateOne: {
-                filter:  { chunk_id: id },
-                update:  { $setOnInsert: { batch_id: null, timestamp: null } },
-                upsert:  true
+                filter: { chunk_id: id },
+                update: {
+                    $setOnInsert: {
+                        batch_id:    null,
+                        timestamp:   null,
+                        token_count: avgTokenCount
+                    }
+                },
+                upsert: true
             }
         })),
         { ordered: false }
     );
 
-
-
     try {
-        /* 2️⃣  Send to OpenAI */
+        // 3️⃣ rate‐limit and upload the file
         await rateLimiter.waitForSlot();
-        const jsonl = jsonlRows.join('\n');
-        const buffer = Buffer.from(jsonl, 'utf8');        // ← always a Buffer
-        const fileId = await uploadFile(buffer);
-        const batch  = await createBatch(fileId);
+        const payload = Buffer.from(jsonlRows.join('\n'), 'utf8');
+        const fileId  = await uploadFile(payload);
 
-        /* 3️⃣  Update batch_id */
+        // 4️⃣ create the OpenAI batch
+        const batch   = await createBatch(fileId);
+
+        // 5️⃣ back‐fill batch_id for these chunks
         await col.embIndex.updateMany(
             { chunk_id: { $in: chunkIds } },
             { $set: { batch_id: batch.id } }
         );
 
         progress.incrementMetric('completedBatches');
-        logger.info({ batchId: batch.id, queued: chunkIds.length }, 'Batch queued');
+        logger.info(
+            { batchId: batch.id, count: chunkIds.length },
+            'Batch queued'
+        );
     } catch (err) {
         progress.incrementMetric('failedBatches');
         logger.error({ err }, 'Batch creation failed');
@@ -231,10 +240,10 @@ async function flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress }) {
     }
 }
 
+// global handlers
 process.on('unhandledRejection', reason => {
     logger.error({ reason }, 'Unhandled promise rejection');
 });
-
 process.on('uncaughtException', err => {
     logger.fatal({ err }, 'Uncaught exception – shutting down');
     process.exit(1);
