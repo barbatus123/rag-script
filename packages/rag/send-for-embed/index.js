@@ -77,22 +77,22 @@ export async function main(payload = {}, ctx = {}) {
                 }
             });
 
-        const jsonlRows = [];
         const reqRows = [];
+        const reqRow = [];
         const chunkIds  = [];
         let embeddingsCount = 0;
 
         const flushEmbeddingsRequest = () => {
-            if (reqRows.length === 0) return;
+            if (reqRow.length === 0) return;
 
-            jsonlRows.push(
+            reqRows.push(
                 JSON.stringify({
-                    custom_id: reqRows.map(row => row.id).join(','),
+                    custom_id: reqRow.map(row => row.id).join(','),
                     method: 'POST',
                     url: '/v1/embeddings',
                     body: {
                         model: config.embeddingModel,
-                        input: reqRows.map(row => row.input)
+                        input: reqRow.map(row => row.input)
                     }
                 })
             );
@@ -108,16 +108,16 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             const { text, tokens } = trimTokens(doc.html_content);
-            reqRows.push({
+            reqRow.push({
                 id:    vectorId,
                 input: text
             });
             embeddingsCount += 1;
             chunkIds.push(vectorId);
 
-            if (reqRows.length === BATCH_PER_REQUEST) {
+            if (reqRow.length === BATCH_PER_REQUEST) {
                 flushEmbeddingsRequest();
-                reqRows.length = 0;
+                reqRow.length = 0;
             }
 
             progress.updateTokens(tokens);
@@ -129,10 +129,10 @@ export async function main(payload = {}, ctx = {}) {
             const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
             if (embeddingsCount >= MAX_EMBEDDINGS_PER_BATCH || nearTimeout) {
                 flushEmbeddingsRequest();
-                await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
-                jsonlRows.length = 0;
-                chunkIds.length  = 0;
+                await flushBatch({ reqRows, chunkIds, col, rateLimiter, progress });
                 reqRows.length = 0;
+                chunkIds.length  = 0;
+                reqRow.length = 0;
                 embeddingsCount = 0;
                 if (nearTimeout) break;      // exit loop safely
             }
@@ -150,7 +150,7 @@ export async function main(payload = {}, ctx = {}) {
         }
 
         flushEmbeddingsRequest();
-        await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
+        await flushBatch({ reqRows, chunkIds, col, rateLimiter, progress });
 
         const duration = ((Date.now() - started) / 1000).toFixed(1) + 's';
         logger.info({ duration, metrics: progress.metrics },
@@ -172,8 +172,8 @@ export async function main(payload = {}, ctx = {}) {
    2. Create the OpenAI batch (rate‑limited).
    3. Back‑fill `batch_id` for those same docs.
 ─────────────────────────────────────────────────────────────────────────── */
-async function flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress }) {
-    if (!jsonlRows.length) return;
+async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
+    if (!reqRows.length) return;
 
     progress.incrementMetric('totalBatches');
 
@@ -194,7 +194,7 @@ async function flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress }) {
 
     try {
         await rateLimiter.waitForSlot();
-        const jsonl = jsonlRows.join('\n');
+        const jsonl = reqRows.join('\n');
         const buffer = Buffer.from(jsonl, 'utf8');
         const fileId = await uploadFile(buffer);
         const batch  = await createBatch(fileId);
