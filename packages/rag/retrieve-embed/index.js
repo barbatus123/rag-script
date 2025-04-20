@@ -49,10 +49,29 @@ export async function main(payload = {}, ctx = {}) {
                 logger.error({ err, batchId }, 'batchStatus failed');
                 continue;
             }
+
             if (status.status !== 'completed') {
                 logger.warn({ batchId, status: status.status }, 'batch not ready');
                 continue;
             }
+
+            try {
+                let  errorStream = await downloadFile(status.error_file_id);
+                await pipeline(
+                    errorStream,
+                    split2(JSON.parse),
+                    async function (source) {
+                        for await (const row of source) {
+                            const custom_id = row.custom_id;
+                            const vectorIds = custom_id.split(',');
+                            col.embIndex.updateMany(
+                                { chunk_id: { $in: vectorIds } },
+                                { $set: { batch_id: null } }
+                            );
+                        }
+                    }
+                );
+            } catch (err) {}
 
             // download JSONL stream
             let outStream;
@@ -63,7 +82,7 @@ export async function main(payload = {}, ctx = {}) {
                 continue;
             }
 
-            logger.warn({ batchId }, 'processing completed batch');
+            logger.info({ batchId }, 'processing completed batch');
 
             async function loadChunks(vectorIds) {
                 const queries = vectorIds.map(vectorId => {
@@ -77,17 +96,15 @@ export async function main(payload = {}, ctx = {}) {
                 return chunks;
             }
 
-            const objects = [];
+            const weaviateObjects = [];
             const vectorIdByUUID = {};
-
-            // ── Stream, insert into Weaviate + AI_FOR_RAG ───────────
             await pipeline(
                 outStream,
                 split2(JSON.parse),
                 async function (source) {
                     for await (const row of source) {
                         const custom_id = row.custom_id;
-                        const vectorIds = custom_id.split('-');
+                        const vectorIds = custom_id.split(',');
                         const embeddings = row.response.body.data;
                         const chunks = await loadChunks(vectorIds);
                         const nowISO = new Date().toISOString();
@@ -96,7 +113,7 @@ export async function main(payload = {}, ctx = {}) {
                         for (const chunk of chunks) {
                             const id = uuidv4();
                             vectorIdByUUID[id] = vectorIds[count];
-                            objects.push({
+                            weaviateObjects.push({
                                 class: mapClass(chunk.metadata.data_type),
                                 id,
                                 vector: embeddings[count].embedding,
@@ -114,29 +131,29 @@ export async function main(payload = {}, ctx = {}) {
                             });
                             count++;
                             processedSources.add(chunk.source);
+                        
                         }
-                        console.log(objects.length);
                     }
                 }
             );
 
             const doneVectorIds = [];
-            for (let i = 0; i < objects.length; i += 1000) {
-                const batch = objects.slice(i, i + 1000);
+            for (let i = 0; i < weaviateObjects.length; i += 1000) {
+                const batch = weaviateObjects.slice(i, i + 1000);
                 const responses = await wv.batch.objectsBatcher().withObjects(batch).do();
                 for (const response of responses) {
                     if (response.result.status === 'SUCCESS') {
                         doneVectorIds.push(vectorIdByUUID[response.id]);
                     }
                 }
+                await col.embIndex.updateMany(
+                    { chunk_id: { $in: doneVectorIds } },
+                    { $set: { timestamp: new Date() } }
+                );
                 await col.ragReady.updateMany(
                     { chunk_id: { $in: doneVectorIds } },
                     { $set: { timestamp: new Date() } },
                     { upsert: true }
-                );
-                await col.embIndex.updateMany(
-                    { chunk_id: { $in: doneVectorIds } },
-                    { $set: { timestamp: new Date() } }
                 );
             }
 
