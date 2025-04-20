@@ -1,14 +1,15 @@
 import { config } from './lib/config.js';
 import { logger } from './lib/logger.js';
 import { getMongo, collections } from './lib/mongo.js';
-import { countTokens } from './lib/tokenUtils.js';
+import { countTokens, trimTokens } from './lib/tokenUtils.js';
 import { uploadFile, createBatch } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
 
-const MAX_JSONL_ROWS = 20_000;    // OpenAI hard limit per batch
+const MAX_JSONL_ROWS = 50_000;    // OpenAI hard limit per batch
 const SAFETY_WINDOW  = 20_000;    // ms before hardDeadline to exit loop
 const LOG_EVERY      = 1000;       // progress log cadence
+const BATCH_PER_REQ  = 16;
 
 /**
  * DigitalOcean Functions entry‑point – Script‑1 (manual trigger)
@@ -16,7 +17,7 @@ const LOG_EVERY      = 1000;       // progress log cadence
 
 export async function main(payload = {}, ctx = {}) {
     const started      = Date.now();
-    const hardDeadline = started + 850_000;          // 850 s (leave 50 s spare)
+    const hardDeadline = started + 850_000;          // 850 s (leave 50 s spare)
 
     const rateLimiter  = new RateLimiter(config.openAiRateLimit);
     const progress     = new ProgressTracker(config.processId);
@@ -24,7 +25,6 @@ export async function main(payload = {}, ctx = {}) {
     logger.info({ processId: config.processId }, 'sendForEmbed started');
 
     try {
-        /* ── Connect to Mongo ─────────────────────────────────────────────── */
         const client = await getMongo();
         const db     = client.db(config.databaseName);
         const col    = collections(db);
@@ -32,11 +32,6 @@ export async function main(payload = {}, ctx = {}) {
         /* ------------------------------------------------------------------
         * Optional one‑shot cleanup
         * Trigger with payload = { "clean": true }
-        * Deletes:
-        *   • AI_EMBEDDING        – all rows
-        *   • AI_FOR_RAG          – tracking table
-        *   • SIGNAL_RAG          – per‑source done flags
-        *   • (optionally) AI_TEMP – any leftovers
         * -----------------------------------------------------------------*/
         const shouldClean = payload?.clean === true;
 
@@ -72,7 +67,10 @@ export async function main(payload = {}, ctx = {}) {
 
         /* Stream chunks in deterministic order */
         const cursor = col.chunks
-            .find({}, {
+            .find({
+                chunk_id: 1,
+                page_counter: 1,
+            }, {
                 projection: {
                     html_content: 1,
                     chunk_id: 1,
@@ -83,7 +81,25 @@ export async function main(payload = {}, ctx = {}) {
             });
 
         const jsonlRows = [];
+        const reqRows = [];
         const chunkIds  = [];
+        let embeddingsCount = 0;
+
+        const flushEmbeddingsRequest = () => {
+            if (reqRows.length === 0) return;
+
+            jsonlRows.push(
+                JSON.stringify({
+                    custom_id: reqRows.map(row => row.id).join(','),
+                    method: 'POST',
+                    url: '/v1/embeddings',
+                    body: {
+                        model: config.embeddingModel,
+                        input: reqRows.map(row => row.input)
+                    }
+                })
+            );
+        }
 
         while (await cursor.hasNext()) {
             const doc = await cursor.next();
@@ -94,19 +110,18 @@ export async function main(payload = {}, ctx = {}) {
                 continue;
             }
 
-            const tokens = countTokens(doc.html_content);
-            if (tokens > 8191) {
-                logger.warn({ vectorId, tokens }, 'Chunk too large – skipped');
-                progress.incrementMetric('skippedChunks');
-                continue;
-            }
-
-            jsonlRows.push(JSON.stringify({
+            const { text, tokens } = trimTokens(doc.html_content);
+            reqRows.push({
                 id:    vectorId,
-                model: config.embeddingModel,
-                input: doc.html_content
-            }));
+                input: text
+            });
+            embeddingsCount += 1;
             chunkIds.push(vectorId);
+
+            if (reqRows.length === BATCH_PER_REQ) {
+                flushEmbeddingsRequest();
+                reqRows.length = 0;
+            }
 
             progress.updateTokens(tokens);
             progress.incrementMetric('processedChunks');
@@ -115,10 +130,13 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
-            if (jsonlRows.length >= MAX_JSONL_ROWS || nearTimeout) {
+            if (embeddingsCount >= MAX_JSONL_ROWS || nearTimeout) {
+                flushEmbeddingsRequest();
                 await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
                 jsonlRows.length = 0;
                 chunkIds.length  = 0;
+                reqRows.length = 0;
+                embeddingsCount = 0;
                 if (nearTimeout) break;      // exit loop safely
             }
 
@@ -134,10 +152,8 @@ export async function main(payload = {}, ctx = {}) {
             }
         }
 
-        /* final flush */
-        if (jsonlRows.length) {
-            await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
-        }
+        flushEmbeddingsRequest();
+        await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
 
         const duration = ((Date.now() - started) / 1000).toFixed(1) + 's';
         logger.info({ duration, metrics: progress.metrics },
@@ -164,29 +180,28 @@ async function flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress }) {
 
     progress.incrementMetric('totalBatches');
 
-    /* 1️⃣  Mark chunks as in‑flight */
-    await col.embIndex.bulkWrite(
-        chunkIds.map(id => ({
-            updateOne: {
-                filter:  { chunk_id: id },
-                update:  { $setOnInsert: { batch_id: null, timestamp: null } },
-                upsert:  true
-            }
-        })),
-        { ordered: false }
-    );
-
-
+    const bulkOps = chunkIds.map(chunkId => ({
+        updateOne: {
+            filter: { chunk_id: chunkId },
+            update: { 
+                $setOnInsert: { 
+                    chunk_id: chunkId,
+                    batch_id: null, 
+                    timestamp: null 
+                }
+            },
+            upsert: true
+        }
+    }));
+    await col.embIndex.bulkWrite(bulkOps);
 
     try {
-        /* 2️⃣  Send to OpenAI */
         await rateLimiter.waitForSlot();
         const jsonl = jsonlRows.join('\n');
-        const buffer = Buffer.from(jsonl, 'utf8');        // ← always a Buffer
+        const buffer = Buffer.from(jsonl, 'utf8');
         const fileId = await uploadFile(buffer);
         const batch  = await createBatch(fileId);
 
-        /* 3️⃣  Update batch_id */
         await col.embIndex.updateMany(
             { chunk_id: { $in: chunkIds } },
             { $set: { batch_id: batch.id } }
