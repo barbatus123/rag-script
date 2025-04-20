@@ -6,7 +6,6 @@ import { uploadFile, createBatch } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
 
-const MAX_JSONL_ROWS = 20_000;    // OpenAI hard limit per batch
 const SAFETY_WINDOW  = 20_000;    // ms before hardDeadline to exit loop
 const LOG_EVERY      = 1000;       // progress log cadence
 
@@ -58,12 +57,12 @@ export async function main(payload = {}, ctx = {}) {
 
         logger.warn(
             {
-               alreadyFinished: completedSet.size,
-               totalChunks: progress.metrics.totalChunks
+                alreadyFinished: completedSet.size,
+                totalChunks: progress.metrics.totalChunks
             },
-         completedSet.size
-           ? 'Resuming: some chunks already complete – continuing where we left off'
-               : 'No completed chunks found – starting fresh'
+            completedSet.size
+                ? 'Resuming: some chunks already complete – continuing where we left off'
+                : 'No completed chunks found – starting fresh'
         );
 
         /* For progress metrics */
@@ -82,8 +81,9 @@ export async function main(payload = {}, ctx = {}) {
                 }
             });
 
-        const jsonlRows = [];
-        const chunkIds  = [];
+        let jsonlRows = [];
+        let chunkIds  = [];
+        let batchTokens = 0;
 
         while (await cursor.hasNext()) {
             const doc = await cursor.next();
@@ -95,27 +95,57 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             const tokens = countTokens(doc.html_content);
-            if (tokens > 8191) {
-                logger.warn({ vectorId, tokens }, 'Chunk too large – skipped');
+            if (tokens > config.maxTokenPerBatch) {
+                logger.warn({vectorId, tokens}, 'Chunk too large – skipped');
                 progress.incrementMetric('skippedChunks');
                 continue;
             }
 
+            // If adding this chunk would exceed either the token or count limits, flush first
+            const needFlush =
+                jsonlRows.length > 0 && (
+                    jsonlRows.length >= Math.min(config.batchSize, config.maxJsonlRows) ||
+                    batchTokens + tokens > config.maxTokenPerBatch ||
+                    Date.now() >= hardDeadline - SAFETY_WINDOW
+                );
+
+            if (needFlush) {
+                await flushBatch({jsonlRows, chunkIds, col, rateLimiter, progress});
+                jsonlRows = [];
+                chunkIds = [];
+                batchTokens = 0;
+                if (Date.now() >= hardDeadline - SAFETY_WINDOW) {
+                    logger.warn('Safety window reached — exiting loop');
+                    break;
+                }
+            }
+
             jsonlRows.push(JSON.stringify({
-                id:    vectorId,
-                model: config.embeddingModel,
-                input: doc.html_content
+                custom_id: vectorId,
+                method: 'POST',
+                url: '/v1/embeddings',
+                body: {
+                    model: config.embeddingModel,
+                    input: doc.html_content
+                }
             }));
             chunkIds.push(vectorId);
 
+            // Track tokens & metrics
+            batchTokens += tokens;
             progress.updateTokens(tokens);
             progress.incrementMetric('processedChunks');
             if (progress.metrics.processedChunks % LOG_EVERY === 0) {
-                logger.info({ processed: progress.metrics.processedChunks }, 'progress');
+                logger.info({
+                    processed: progress.metrics.processedChunks,
+                    batchSize: jsonlRows.length,
+                    batchTokens
+                }, 'progress');
             }
 
+
             const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
-            if (jsonlRows.length >= MAX_JSONL_ROWS || nearTimeout) {
+            if (jsonlRows.length >= config.maxJsonlRows || nearTimeout) {
                 await flushBatch({ jsonlRows, chunkIds, col, rateLimiter, progress });
                 jsonlRows.length = 0;
                 chunkIds.length  = 0;
@@ -123,7 +153,7 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             if (progress.metrics.processedChunks % LOG_EVERY === 0) {
-                logger.info(
+                logger.warn(
                     {
                         processed: progress.metrics.processedChunks,
                         skipped:   progress.metrics.skippedChunks,
@@ -140,10 +170,10 @@ export async function main(payload = {}, ctx = {}) {
         }
 
         const duration = ((Date.now() - started) / 1000).toFixed(1) + 's';
-        logger.info({ duration, metrics: progress.metrics },
-        completedSet.size
-           ? 'sendForEmbed finished (resume run)'
-            : 'sendForEmbed finished (initial run)');
+        logger.warn({ duration, metrics: progress.metrics },
+            completedSet.size
+                ? 'sendForEmbed finished (resume run)'
+                : 'sendForEmbed finished (initial run)');
 
         return { statusCode: 200, body: JSON.stringify(progress.metrics) };
     } catch (err) {
