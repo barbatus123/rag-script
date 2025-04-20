@@ -2,14 +2,16 @@ import { config } from './lib/config.js';
 import { logger } from './lib/logger.js';
 import { getMongo, collections } from './lib/mongo.js';
 import { countTokens, trimTokens } from './lib/tokenUtils.js';
-import { uploadFile, createBatch } from './lib/openai.js';
+import { uploadFile, createBatch, batchStatus } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
+import { v4 as uuidv4 } from 'uuid';
 
 const MAX_EMBEDDINGS_PER_BATCH = 50_000;    // OpenAI hard limit per batch
 const SAFETY_WINDOW  = 20_000;    // ms before hardDeadline to exit loop
 const LOG_EVERY      = 1000;       // progress log cadence
-const BATCH_PER_REQUEST  = 16;
+const BATCH_PER_REQUEST  = 13;
+const MAX_TOKENS_PER_BATCH = 500_000;
 
 /**
  * DigitalOcean Functions entry‑point – Script‑1 (manual trigger)
@@ -80,14 +82,16 @@ export async function main(payload = {}, ctx = {}) {
         const reqRows = [];
         const reqRow = [];
         const chunkIds  = [];
+        const chunkUuids = [];
         let embeddingsCount = 0;
+        let batchTokens = 0;
 
         const flushEmbeddingsRequest = () => {
             if (reqRow.length === 0) return;
 
             reqRows.push(
                 JSON.stringify({
-                    custom_id: reqRow.map(row => row.id).join(','),
+                    custom_id: reqRow.map(row => row.uuid).join(','),
                     method: 'POST',
                     url: '/v1/embeddings',
                     body: {
@@ -108,12 +112,31 @@ export async function main(payload = {}, ctx = {}) {
             }
 
             const { text, tokens } = trimTokens(doc.html_content);
+
+            const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
+            if ((embeddingsCount + 1) > MAX_EMBEDDINGS_PER_BATCH || (batchTokens + tokens) > MAX_TOKENS_PER_BATCH || nearTimeout) {
+                flushEmbeddingsRequest();
+                const status = await flushBatch({ reqRows, chunkIds, chunkUuids, col, rateLimiter, progress });
+                // If we hit max tokens limit that can be processed simultaneously, exit and try another time.
+                if (status === 'failed') {
+                    return { statusCode: 500, body: 'Creating batch failed: likely max enqueued tokens limit reached' };
+                }
+                if (nearTimeout) return;
+                reqRows.length = 0;
+                chunkIds.length  = 0;
+                reqRow.length = 0;
+                embeddingsCount = 0;
+                batchTokens = 0;
+            }
+
             reqRow.push({
-                id:    vectorId,
+                uuid: uuidv4(),
                 input: text
             });
             embeddingsCount += 1;
+            batchTokens += tokens;
             chunkIds.push(vectorId);
+            chunkUuids.push(reqRow.id);
 
             if (reqRow.length === BATCH_PER_REQUEST) {
                 flushEmbeddingsRequest();
@@ -122,21 +145,6 @@ export async function main(payload = {}, ctx = {}) {
 
             progress.updateTokens(tokens);
             progress.incrementMetric('processedChunks');
-            if (progress.metrics.processedChunks % LOG_EVERY === 0) {
-                logger.info({ processed: progress.metrics.processedChunks }, 'progress');
-            }
-
-            const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
-            if (embeddingsCount >= MAX_EMBEDDINGS_PER_BATCH || nearTimeout) {
-                flushEmbeddingsRequest();
-                await flushBatch({ reqRows, chunkIds, col, rateLimiter, progress });
-                reqRows.length = 0;
-                chunkIds.length  = 0;
-                reqRow.length = 0;
-                embeddingsCount = 0;
-                if (nearTimeout) break;      // exit loop safely
-            }
-
             if (progress.metrics.processedChunks % LOG_EVERY === 0) {
                 logger.info(
                     {
@@ -150,7 +158,11 @@ export async function main(payload = {}, ctx = {}) {
         }
 
         flushEmbeddingsRequest();
-        await flushBatch({ reqRows, chunkIds, col, rateLimiter, progress });
+        const status = await flushBatch({ reqRows, chunkIds, chunkUuids, col, rateLimiter, progress });
+        if (status === 'failed') {
+            logger.error({ status }, 'Batch failed');
+            return { statusCode: 500, body: 'Creating batch failed: likely max enqueued tokens limit reached' };
+        }
 
         const duration = ((Date.now() - started) / 1000).toFixed(1) + 's';
         logger.info({ duration, metrics: progress.metrics },
@@ -172,7 +184,7 @@ export async function main(payload = {}, ctx = {}) {
    2. Create the OpenAI batch (rate‑limited).
    3. Back‑fill `batch_id` for those same docs.
 ─────────────────────────────────────────────────────────────────────────── */
-async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
+async function flushBatch({ reqRows, chunkIds, chunkUuids, col, rateLimiter, progress }) {
     if (!reqRows.length) return;
 
     progress.incrementMetric('totalBatches');
@@ -183,6 +195,7 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
             update: { 
                 $setOnInsert: { 
                     chunk_id: chunkId,
+                    chunk_uuid: chunkUuids[index],
                     batch_id: null, 
                     timestamp: null 
                 }
@@ -199,6 +212,10 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
         const fileId = await uploadFile(buffer);
         const batch  = await createBatch(fileId);
 
+        await new Promise(resolve => setTimeout(resolve, 30000));
+
+        const statusResponse = await batchStatus(batch.id);
+
         await col.embIndex.updateMany(
             { chunk_id: { $in: chunkIds } },
             { $set: { batch_id: batch.id } }
@@ -206,6 +223,8 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
 
         progress.incrementMetric('completedBatches');
         logger.info({ batchId: batch.id, queued: chunkIds.length }, 'Batch queued');
+
+        return statusResponse.status;
     } catch (err) {
         progress.incrementMetric('failedBatches');
         logger.error({ err }, 'Batch creation failed');
