@@ -9,16 +9,6 @@ import { encoding_for_model } from 'tiktoken';
 
 const enc = encoding_for_model('text-embedding-ada-002');
 
-export function countTokens(text = '') {
-    if (typeof text !== 'string') text = String(text || '');
-
-    // naive strip of <> tags to avoid over‑counting markup
-    const stripped = text.replace(/<[^>]*?>/g, '');
-
-    // Use tiktoken for accurate token counting
-    return enc.encode(stripped).length;
-}
-
 export function trimTokens(text, maxTokens = 512) {
     const tokens = enc.encode(text);
     if (tokens.length <= maxTokens) {

@@ -95,3 +95,41 @@ export async function downloadFile(fileId) {
     });
     return data;                       // JSONL stream
 }
+
+export async function * listAllBatches() {
+    let after = null;
+    while (true) {
+        const { data } = await client.get(`/batches?limit=100&after=${after ?? ''}`, {
+            responseType: 'json'
+        });
+
+        for (const batch of data.data ?? []) {
+            yield batch;
+        }
+
+        after = data.last_id;
+
+        if (data.data.length < 100) {
+            break;
+        }
+    }
+}
+
+export async function getRecentEmbeddingRequests() {
+    const cutoff = Date.now() - 24 * 3600_000;
+    let currentRequests = 0;
+
+    let count = 0;
+    for await (const b of listAllBatches()) {
+        if (b.created_at * 1000 < cutoff) break;
+
+        const status = (b.status || '').toLowerCase();
+        const counts = b.request_counts ?? {};
+    
+        if (['completed', 'in_progress', 'processing', 'finalizing', 'validating'].includes(status)) {
+            currentRequests += counts.total ?? 0;
+        }
+    }
+
+    return currentRequests;
+}
