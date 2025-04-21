@@ -21,7 +21,7 @@ async function processFailedBatch({ col, fileId }) {
 
   await col.embIndex.updateMany(
     { chunk_id: { $in: failedVectorIds } },
-    { $set: { batch_id: null } },
+    { $set: { batch_id: null, batched_at: null } },
   );
 
   logger.info({ failedChunks: failedVectorIds.length }, 'Remove batch_id from failed chunks');

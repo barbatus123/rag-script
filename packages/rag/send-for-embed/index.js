@@ -2,7 +2,7 @@ import { config } from '../lib/config.js';
 import { logger } from '../lib/logger.js';
 import { getMongo, collections } from '../lib/mongo.js';
 import { trimTokens } from '../lib/tokenUtils.js';
-import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from '../lib/openai.js';
+import { uploadFile, createBatch, batchStatus } from '../lib/openai.js';
 import { RateLimiter } from '../lib/rateLimiter.js';
 import { ProgressTracker } from '../lib/progressTracker.js';
 
@@ -97,9 +97,7 @@ export async function main(payload = {}, ctx = {}) {
       return { statusCode: 200, body: 'sendForEmbed has already processed all chunks' };
     }
 
-    const recentEmbeddingRequests = await getRecentEmbeddingRequests();
-    const tokensCapacity =
-      config.orgTokenLimit - Math.max(recentEmbeddingRequests * 450, batchedTokens);
+    const tokensCapacity = config.orgTokenLimit - batchedTokens;
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
