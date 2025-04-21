@@ -6,10 +6,8 @@ import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
 
-const MAX_EMBEDDINGS_PER_BATCH = 50_000; // OpenAI embeddings request limit per batch
 const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
-const MAX_TOKENS_PER_DAY = 3_000_000; // 3 million tokens per day for tier 1
 
 /**
  * DigitalOcean Functions entry‑point – Script‑1 (manual trigger)
@@ -74,7 +72,7 @@ export async function main(payload = {}, ctx = {}) {
 
     const recentEmbeddingRequests = await getRecentEmbeddingRequests();
     // According to the spec, the max tokens per chunk is ~512
-    const tokensCapacity = MAX_TOKENS_PER_DAY - recentEmbeddingRequests * 512;
+    const tokensCapacity = config.orgTokenLimit - recentEmbeddingRequests * 512;
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
@@ -111,7 +109,7 @@ export async function main(payload = {}, ctx = {}) {
 
       const nearTimeout = Date.now() >= hardDeadline - SAFETY_WINDOW;
       if (
-        embeddingsCount + 1 > MAX_EMBEDDINGS_PER_BATCH ||
+        embeddingsCount + 1 > config.maxEmbeddingsPerBatch ||
         batchTokens + tokens > tokensCapacity ||
         nearTimeout
       ) {
