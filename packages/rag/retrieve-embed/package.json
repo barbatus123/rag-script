@@ -15,7 +15,18 @@
     "uuid": "^9.0.1",
     "weaviate-ts-client": "^2.2.0"
   },
+  "scripts": {
+    "lint": "eslint . --ext .js",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write ."
+  },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.25.0",
+    "eslint-config-prettier": "^10.1.2",
+    "eslint-plugin-prettier": "^5.2.6",
+    "prettier": "^3.5.3"
   }
 }
