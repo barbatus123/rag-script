@@ -123,6 +123,8 @@ export async function main() {
         }
       });
 
+      logger.info({ chunkEmbeddings: chunkEmbeddings.length }, 'Chunk embeddings loaded');
+
       const vectorIdByUUID = {};
       const chunks = await loadChunks(chunkEmbeddings.map(chunk => chunk.vectorId));
       const weaviateObjects = chunks.map((chunk, index) => {
@@ -146,6 +148,8 @@ export async function main() {
           },
         };
       });
+
+      logger.info({ weaviateObjects: weaviateObjects.length }, 'Weaviate objects prepared');
 
       const doneVectorIds = [];
       for (let i = 0; i < weaviateObjects.length; i += 1000) {

@@ -9,6 +9,28 @@ import { ProgressTracker } from './lib/progressTracker.js';
 const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
 
+async function getRecentlyBatchedTokens(col) {
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+  const result = await col.embIndex
+    .aggregate([
+      {
+        $match: {
+          batched_at: { $gte: oneDayAgo },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalTokens: { $sum: '$tokens' },
+        },
+      },
+    ])
+    .toArray();
+
+  return result[0]?.totalTokens || 0;
+}
+
 /**
  * DigitalOcean Functions entry‑point – Script‑1 (manual trigger)
  */
@@ -42,19 +64,21 @@ export async function main(payload = {}, ctx = {}) {
       logger.warn('Cleanup complete; continuing with fresh run.');
     }
 
+    const batchQuery = { batch_id: { $ne: null } };
     const batchedSet = new Set(
-      await col.temp.distinct(
-        'chunk_id',
-        srcParam
-          ? {
-              chunk_id: { $regex: `^${srcParam}` },
-              batch_id: { $ne: null },
-            }
-          : {
-              batch_id: { $ne: null },
-            },
-      ),
+      await col.embIndex
+        .find(
+          srcParam
+            ? {
+                ...batchQuery,
+                chunk_id: { $regex: `^${srcParam}` },
+              }
+            : batchQuery,
+        )
+        .toArray(),
     );
+    const batchedTokens = await getRecentlyBatchedTokens(col);
+
     const totalChunks = await col.chunks.find(srcParam ? { source: srcParam } : {}).count();
 
     logger.warn(
@@ -75,7 +99,8 @@ export async function main(payload = {}, ctx = {}) {
 
     const recentEmbeddingRequests = await getRecentEmbeddingRequests();
     // According to the spec, the max tokens per chunk is ~512
-    const tokensCapacity = config.orgTokenLimit - recentEmbeddingRequests * 512;
+    const tokensCapacity =
+      config.orgTokenLimit - Math.max(recentEmbeddingRequests * 450, batchedTokens);
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
@@ -83,18 +108,29 @@ export async function main(payload = {}, ctx = {}) {
     }
 
     /* Stream chunks in deterministic order */
-    const cursor = col.chunks.find(srcParam ? { source: srcParam } : {}, {
-      projection: {
-        html_content: 1,
-        chunk_id: 1,
-        page_counter: 1,
-        source: 1,
-        metadata: 1,
+    const query = {
+      $or: [{ batch_id: null }, { batch_id: { $exists: false } }],
+    };
+    const cursor = col.chunks.find(
+      srcParam
+        ? {
+            ...query,
+            source: srcParam,
+          }
+        : query,
+      {
+        projection: {
+          html_content: 1,
+          chunk_id: 1,
+          page_counter: 1,
+          source: 1,
+          metadata: 1,
+        },
       },
-    });
+    );
 
     const reqRows = [];
-    const chunkIds = [];
+    const chunks = [];
     let embeddingsCount = 0;
     let batchTokens = 0;
 
@@ -116,7 +152,7 @@ export async function main(payload = {}, ctx = {}) {
         batchTokens + tokens > tokensCapacity ||
         nearTimeout
       ) {
-        const status = await flushBatch({ reqRows, chunkIds, col, rateLimiter, progress });
+        const status = await flushBatch({ reqRows, chunks, col, rateLimiter, progress });
         // If we hit max tokens limit that can be processed simultaneously, exit and try another time.
         if (status === 'failed') {
           return {
@@ -134,7 +170,7 @@ export async function main(payload = {}, ctx = {}) {
           };
         }
         reqRows.length = 0;
-        chunkIds.length = 0;
+        chunks.length = 0;
         embeddingsCount = 0;
         batchTokens = 0;
       }
@@ -152,10 +188,12 @@ export async function main(payload = {}, ctx = {}) {
       );
       embeddingsCount += 1;
       batchTokens += tokens;
-      chunkIds.push(vectorId);
+      chunks.push({
+        vectorId,
+        tokens,
+      });
 
       // Track tokens & metrics
-      batchTokens += tokens;
       progress.updateTokens(tokens);
       progress.incrementMetric('processedChunks');
       if (progress.metrics.processedChunks % LOG_EVERY === 0) {
@@ -169,7 +207,7 @@ export async function main(payload = {}, ctx = {}) {
       }
     }
 
-    const status = await flushBatch({ reqRows, chunkIds, col, rateLimiter, progress });
+    const status = await flushBatch({ reqRows, chunks, col, rateLimiter, progress });
     if (status === 'failed') {
       return {
         statusCode: 200,
@@ -187,7 +225,7 @@ export async function main(payload = {}, ctx = {}) {
   }
 }
 
-async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
+async function flushBatch({ reqRows, chunks, col, rateLimiter, progress }) {
   if (!reqRows.length) return;
 
   // 1️⃣ increment batch counter
@@ -211,14 +249,16 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
       return 'failed';
     }
 
-    const bulkOps = chunkIds.map(chunkId => ({
+    const bulkOps = chunks.map(({ vectorId, tokens }) => ({
       updateOne: {
-        filter: { chunk_id: chunkId },
+        filter: { chunk_id: vectorId },
         update: {
           $setOnInsert: {
-            chunk_id: chunkId,
+            chunk_id: vectorId,
             batch_id: batch.id,
             timestamp: null,
+            batched_at: new Date(),
+            tokens,
           },
         },
         upsert: true,
@@ -226,7 +266,7 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
     }));
     await col.embIndex.bulkWrite(bulkOps);
     progress.incrementMetric('completedBatches');
-    logger.info({ batchId: batch.id, queued: chunkIds.length }, 'Batch queued');
+    logger.info({ batchId: batch.id, queued: chunks.length }, 'Batch queued');
 
     return statusResponse.status;
   } catch (err) {
