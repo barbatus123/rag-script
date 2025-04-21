@@ -37,7 +37,7 @@ export async function main(payload = {}, ctx = {}) {
         const shouldClean = payload?.clean === true;
 
         if (shouldClean) {
-            logger.warn('🧹 Clean flag detected – purging previous embeddings …');
+            logger.warn('Clean flag detected – purging previous embeddings …');
             await Promise.all([
                 col.embIndex.deleteMany({}),
                 col.ragReady.deleteMany({}),
@@ -147,6 +147,8 @@ export async function main(payload = {}, ctx = {}) {
             batchTokens += tokens;
             chunkIds.push(vectorId);
 
+            // Track tokens & metrics
+            batchTokens += tokens;
             progress.updateTokens(tokens);
             progress.incrementMetric('processedChunks');
             if (progress.metrics.processedChunks % LOG_EVERY === 0) {
@@ -155,7 +157,7 @@ export async function main(payload = {}, ctx = {}) {
                         processed: progress.metrics.processedChunks,
                         skipped:   progress.metrics.skippedChunks,
                     },
-                    'in‑progress'
+                    'progress'
                 );
             }
         }
@@ -169,6 +171,7 @@ export async function main(payload = {}, ctx = {}) {
         logger.info({ duration, metrics: progress.metrics }, 'sendForEmbed finished');
 
         return { statusCode: 200, body: JSON.stringify(progress.metrics) };
+
     } catch (err) {
         logger.error({ err }, 'sendForEmbed failed');
         return { statusCode: 500, body: err.message };
@@ -178,6 +181,7 @@ export async function main(payload = {}, ctx = {}) {
 async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
     if (!reqRows.length) return;
 
+    // 1️⃣ increment batch counter
     progress.incrementMetric('totalBatches');
 
     try {
@@ -223,12 +227,11 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
     }
 }
 
+// global handlers
 process.on('unhandledRejection', reason => {
     logger.error({ reason }, 'Unhandled promise rejection');
 });
-
 process.on('uncaughtException', err => {
     logger.fatal({ err }, 'Uncaught exception – shutting down');
     process.exit(1);
 });
-
