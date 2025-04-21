@@ -1,11 +1,12 @@
-import { config } from './lib/config.js';
-import { logger } from './lib/logger.js';
-import { getMongo, collections } from './lib/mongo.js';
-import { batchStatus, downloadFile } from './lib/openai.js';
-import { getWeaviate, mapClass } from './lib/weaviate.js';
 import { pipeline } from 'stream/promises';
 import split2 from 'split2';
 import { v4 as uuidv4 } from 'uuid';
+
+import { config } from '../lib/config.js';
+import { logger } from '../lib/logger.js';
+import { getMongo, collections } from '../lib/mongo.js';
+import { batchStatus, downloadFile } from '../lib/openai.js';
+import { getWeaviate, mapClass } from '../lib/weaviate.js';
 
 const SAFETY_WINDOW = 10_000; // ms before the 850s timeout
 

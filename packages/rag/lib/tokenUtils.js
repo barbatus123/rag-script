@@ -1,10 +1,3 @@
-// Lightweight token estimator that works without native tiktoken binaries.
-// ----------------------------------------------------------------------
-// Heuristic: ~4 characters ≈ 1 token for typical English text. We also
-// remove simple HTML tags so they don't inflate the estimate.
-// This keeps the code dependency‑free and 100% portable in DigitalOcean
-// Functions (or any other constrained runtime).
-
 import { encoding_for_model } from 'tiktoken';
 
 const enc = encoding_for_model('text-embedding-ada-002');

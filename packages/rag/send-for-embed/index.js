@@ -1,10 +1,10 @@
-import { config } from './lib/config.js';
-import { logger } from './lib/logger.js';
-import { getMongo, collections } from './lib/mongo.js';
-import { trimTokens } from './lib/tokenUtils.js';
-import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from './lib/openai.js';
-import { RateLimiter } from './lib/rateLimiter.js';
-import { ProgressTracker } from './lib/progressTracker.js';
+import { config } from '../lib/config.js';
+import { logger } from '../lib/logger.js';
+import { getMongo, collections } from '../lib/mongo.js';
+import { trimTokens } from '../lib/tokenUtils.js';
+import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from '../lib/openai.js';
+import { RateLimiter } from '../lib/rateLimiter.js';
+import { ProgressTracker } from '../lib/progressTracker.js';
 
 const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
@@ -44,7 +44,7 @@ export async function main(payload = {}, ctx = {}) {
 
   logger.info({ processId: config.processId }, 'sendForEmbed started');
   // Source param, if provided, will only process chunks for that source
-  const srcParam = payload.source;
+  const srcParam = 'www.theatrenational.be'; // payload.source;
 
   try {
     const client = await getMongo();
@@ -98,9 +98,7 @@ export async function main(payload = {}, ctx = {}) {
     }
 
     const recentEmbeddingRequests = await getRecentEmbeddingRequests();
-    // According to the spec, the max tokens per chunk is ~512
-    const tokensCapacity =
-      config.orgTokenLimit - Math.max(recentEmbeddingRequests * 450, batchedTokens);
+    const tokensCapacity = config.orgTokenLimit - 0; // Math.max(recentEmbeddingRequests * 450, batchedTokens);
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
@@ -284,3 +282,22 @@ process.on('uncaughtException', err => {
   logger.fatal({ err }, 'Uncaught exception – shutting down');
   process.exit(1);
 });
+
+// setInterval(async () => {
+//   await main();
+// }, 7200000);
+
+// console.log(await getRecentEmbeddingRequests() * 450);
+
+// async function test() {
+//     const client = await getMongo();
+//     const db = client.db(config.databaseName);
+//     const col = collections(db);
+//     // console.log(await getRecentlyBatchedTokens(col));
+
+//     console.log(await col.chunks.distinct('source'));
+// }
+
+// await test();
+
+await main();
