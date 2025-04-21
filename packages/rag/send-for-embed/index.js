@@ -98,7 +98,8 @@ export async function main(payload = {}, ctx = {}) {
     }
 
     const recentEmbeddingRequests = await getRecentEmbeddingRequests();
-    const tokensCapacity = config.orgTokenLimit - 0; // Math.max(recentEmbeddingRequests * 450, batchedTokens);
+    const tokensCapacity =
+      config.orgTokenLimit - Math.max(recentEmbeddingRequests * 450, batchedTokens);
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
@@ -282,22 +283,3 @@ process.on('uncaughtException', err => {
   logger.fatal({ err }, 'Uncaught exception – shutting down');
   process.exit(1);
 });
-
-// setInterval(async () => {
-//   await main();
-// }, 7200000);
-
-// console.log(await getRecentEmbeddingRequests() * 450);
-
-// async function test() {
-//     const client = await getMongo();
-//     const db = client.db(config.databaseName);
-//     const col = collections(db);
-//     // console.log(await getRecentlyBatchedTokens(col));
-
-//     console.log(await col.chunks.distinct('source'));
-// }
-
-// await test();
-
-await main();
