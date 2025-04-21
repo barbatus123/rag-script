@@ -21,17 +21,14 @@ export async function main(payload = {}, ctx = {}) {
   const progress = new ProgressTracker(config.processId);
 
   logger.info({ processId: config.processId }, 'sendForEmbed started');
-  const srcParam = 'www.theatrenational.be';
+  // Source param, if provided, will only process chunks for that source
+  const srcParam = payload.source;
 
   try {
     const client = await getMongo();
     const db = client.db(config.databaseName);
     const col = collections(db);
 
-    /* ------------------------------------------------------------------
-     * Optional one‑shot cleanup
-     * Trigger with payload = { "clean": true }
-     * -----------------------------------------------------------------*/
     const shouldClean = payload?.clean === true;
 
     if (shouldClean) {
@@ -45,12 +42,18 @@ export async function main(payload = {}, ctx = {}) {
       logger.warn('Cleanup complete; continuing with fresh run.');
     }
 
-    /* ── Skip set: only fully‑processed chunks (timestamp≠null) ─────── */
     const batchedSet = new Set(
-      await col.temp.distinct('chunk_id', {
-        chunk_id: { $regex: `^${srcParam}` },
-        batch_id: { $ne: null },
-      }),
+      await col.temp.distinct(
+        'chunk_id',
+        srcParam
+          ? {
+              chunk_id: { $regex: `^${srcParam}` },
+              batch_id: { $ne: null },
+            }
+          : {
+              batch_id: { $ne: null },
+            },
+      ),
     );
     const totalChunks = await col.chunks.find(srcParam ? { source: srcParam } : {}).count();
 
