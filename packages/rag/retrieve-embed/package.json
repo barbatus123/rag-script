@@ -1,5 +1,5 @@
 {
-  "name": "rag-script-function-1",
+  "name": "retrieve-embed",
   "version": "1.0.0",
   "description": "Task 1 RAG script 1",
   "type": "module",

@@ -1,0 +1,33 @@
+{
+  "name": "send-for-embed",
+  "version": "1.0.0",
+  "description": "Task 1 RAG script 1",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "lint": "eslint . --ext .js",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write ."
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "axios-retry": "^3.8.0",
+    "form-data": "^4.0.0",
+    "mongodb": "^6.4.0",
+    "pino": "^8.21.0",
+    "pino-pretty": "^10.2.0",
+    "split2": "^4.1.0",
+    "tiktoken": "^1.0.20",
+    "uuid": "^9.0.1",
+    "weaviate-ts-client": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.25.0",
+    "eslint-config-prettier": "^10.1.2",
+    "eslint-plugin-prettier": "^5.2.6",
+    "prettier": "^3.5.3"
+  }
+}

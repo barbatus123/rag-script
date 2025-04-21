@@ -1,25 +1,25 @@
 parameters: {}
 environment:
-  OPENAI_API_KEY: ""
-  MONGO_URI: ""
+  OPENAI_API_KEY: "${OPENAI_API_KEY}"
+  MONGO_URI: "${MONGO_URI}"
 packages:
   - name: rag
     shared: false
     environment:
-      LOG_LEVEL: warn
+      LOG_LEVEL: info
     parameters: {}
     annotations: {}
     functions:
       - name: send-for-embed
         runtime: nodejs:18
         limits:
-           timeout: 850000
-           memory: 512
+          timeout: 850000
+          memory: 1024
       - name: retrieve-embed
         runtime: nodejs:18
         limits:
           timeout: 850000
-          memory: 512
+          memory: 1024
         environment:
-          WEAVIATE_API_KEY: ""
-          WEAVIATE_API_HOST: ""
+          WEAVIATE_API_KEY: "${WEAVIATE_API_KEY}"
+          WEAVIATE_API_HOST: "${WEAVIATE_API_HOST}"
