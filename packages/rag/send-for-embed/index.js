@@ -1,10 +1,15 @@
-import { config } from '../lib/config.js';
-import { logger } from '../lib/logger.js';
-import { getMongo, collections } from '../lib/mongo.js';
-import { trimTokens } from '../lib/tokenUtils.js';
-import { uploadFile, createBatch, batchStatus } from '../lib/openai.js';
-import { RateLimiter } from '../lib/rateLimiter.js';
-import { ProgressTracker } from '../lib/progressTracker.js';
+import { config } from './lib/config.js';
+import { logger } from './lib/logger.js';
+import { getMongo, collections } from './lib/mongo.js';
+import { trimTokens } from './lib/tokenUtils.js';
+import {
+  uploadFile,
+  createBatch,
+  batchStatus,
+  getRecentEmbeddingRequests,
+} from './lib/openai.js';
+import { RateLimiter } from './lib/rateLimiter.js';
+import { ProgressTracker } from './lib/progressTracker.js';
 
 const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
@@ -44,7 +49,7 @@ export async function main(payload = {}, ctx = {}) {
 
   logger.info({ processId: config.processId }, 'sendForEmbed started');
   // Source param, if provided, will only process chunks for that source
-  const srcParam = 'www.theatrenational.be'; // payload.source;
+  const srcParam = payload.source;
 
   try {
     const client = await getMongo();
@@ -77,7 +82,6 @@ export async function main(payload = {}, ctx = {}) {
         )
         .toArray(),
     );
-    const batchedTokens = await getRecentlyBatchedTokens(col);
 
     const totalChunks = await col.chunks.find(srcParam ? { source: srcParam } : {}).count();
 
@@ -97,7 +101,9 @@ export async function main(payload = {}, ctx = {}) {
       return { statusCode: 200, body: 'sendForEmbed has already processed all chunks' };
     }
 
-    const tokensCapacity = config.orgTokenLimit - batchedTokens;
+    const recentEmbeddingRequests = await getRecentEmbeddingRequests();
+    logger.info({ consumedTokens: recentEmbeddingRequests * 450 }, 'Tokens consumed by recent batches');
+    const tokensCapacity = config.orgTokenLimit - recentEmbeddingRequests * 450;
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
