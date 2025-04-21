@@ -224,7 +224,7 @@ async function flushBatch({ reqRows, chunkIds, col, rateLimiter, progress }) {
         upsert: true,
       },
     }));
-    await col.temp.bulkWrite(bulkOps);
+    await col.embIndex.bulkWrite(bulkOps);
     progress.incrementMetric('completedBatches');
     logger.info({ batchId: batch.id, queued: chunkIds.length }, 'Batch queued');
 
