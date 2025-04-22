@@ -6,7 +6,7 @@ packages:
   - name: rag
     shared: false
     environment:
-      LOG_LEVEL: info
+      LOG_LEVEL: warn
     parameters: {}
     annotations: {}
     functions:

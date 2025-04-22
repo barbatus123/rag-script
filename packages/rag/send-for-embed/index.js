@@ -2,12 +2,7 @@ import { config } from './lib/config.js';
 import { logger } from './lib/logger.js';
 import { getMongo, collections } from './lib/mongo.js';
 import { trimTokens } from './lib/tokenUtils.js';
-import {
-  uploadFile,
-  createBatch,
-  batchStatus,
-  getRecentEmbeddingRequests,
-} from './lib/openai.js';
+import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
 
@@ -102,7 +97,10 @@ export async function main(payload = {}, ctx = {}) {
     }
 
     const recentEmbeddingRequests = await getRecentEmbeddingRequests();
-    logger.info({ consumedTokens: recentEmbeddingRequests * 450 }, 'Tokens consumed by recent batches');
+    logger.warn(
+      { consumedTokens: recentEmbeddingRequests * 450 },
+      'Tokens consumed by recent batches',
+    );
     const tokensCapacity = config.orgTokenLimit - recentEmbeddingRequests * 450;
 
     if (tokensCapacity <= 0) {
