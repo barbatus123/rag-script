@@ -8,6 +8,10 @@ import { getMongo, collections } from './lib/mongo.js';
 import { batchStatus, downloadFile } from './lib/openai.js';
 import { getWeaviate, mapClass } from './lib/weaviate.js';
 
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 const SAFETY_WINDOW = 10_000; // ms before the 850s timeout
 
 async function processFailedBatch({ col, fileId }) {
@@ -165,10 +169,18 @@ export async function main() {
           { chunk_id: { $in: doneVectorIds } },
           { $set: { timestamp: new Date() } },
         );
-        await col.ragReady.updateMany(
-          { chunk_id: { $in: doneVectorIds } },
-          { $set: { timestamp: new Date() } },
-          { upsert: true },
+        await col.ragReady.bulkWrite(
+          doneVectorIds.map(chunk_id => ({
+            updateOne: {
+              filter: { chunk_id },
+              update: {
+                $set: {
+                  timestamp: new Date(),
+                },
+              },
+              upsert: true,
+            },
+          })),
         );
       }
 
@@ -180,7 +192,7 @@ export async function main() {
     for (const src of processedSources) {
       const totalChunks = await col.chunks.countDocuments({ source: src });
       const doneChunks = await col.ragReady.countDocuments({
-        chunk_id: { $regex: `^${src}__` },
+        chunk_id: { $regex: `^${escapeRegExp(src)}__` },
       });
       if (totalChunks === doneChunks) {
         await col.signal.updateOne(
