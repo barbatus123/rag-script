@@ -2,9 +2,13 @@ import { config } from './lib/config.js';
 import { logger } from './lib/logger.js';
 import { getMongo, collections } from './lib/mongo.js';
 import { trimTokens } from './lib/tokenUtils.js';
-import { uploadFile, createBatch, batchStatus } from './lib/openai.js';
+import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
+
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
@@ -64,18 +68,25 @@ export async function main(payload = {}, ctx = {}) {
       logger.warn('Cleanup complete; continuing with fresh run.');
     }
 
-    const batchQuery = { batch_id: { $ne: null } };
+    const doneSources = await col.signal.distinct('source');
+
+    const batchQuery = {
+      batch_id: { $ne: null },
+      chunk_id: doneSources
+        ? { $not: { $regex: `^${doneSources.map(escapeRegExp).join('|')}` } }
+        : {},
+    };
     const batchedSet = new Set(
-      await col.embIndex
-        .find(
-          srcParam
-            ? {
-                ...batchQuery,
-                chunk_id: { $regex: `^${srcParam}` },
-              }
-            : batchQuery,
-        )
-        .toArray(),
+      await col.embIndex.distinct(
+        'chunk_id',
+        srcParam
+          ? {
+              ...batchQuery,
+              chunk_id: { $regex: `^${escapeRegExp(srcParam)}` },
+            }
+          : batchQuery,
+        { projection: { chunk_id: 1 } },
+      ),
     );
 
     const totalChunks = await col.chunks.find(srcParam ? { source: srcParam } : {}).count();
@@ -98,7 +109,7 @@ export async function main(payload = {}, ctx = {}) {
 
     const recentTokens = await getRecentlyBatchedTokens(col);
     logger.warn({ consumedTokens: recentTokens }, 'Tokens consumed by recent batches');
-    const tokensCapacity = config.orgTokenLimit - recentTokens;
+    const tokensCapacity = config.orgTokenLimit - (await getRecentEmbeddingRequests()) * 450;
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
@@ -108,6 +119,7 @@ export async function main(payload = {}, ctx = {}) {
     /* Stream chunks in deterministic order */
     const query = {
       $or: [{ batch_id: null }, { batch_id: { $exists: false } }],
+      source: doneSources ? { $not: { $in: doneSources } } : {},
     };
     const cursor = col.chunks.find(
       srcParam
@@ -251,8 +263,7 @@ async function flushBatch({ reqRows, chunks, col, rateLimiter, progress }) {
       updateOne: {
         filter: { chunk_id: vectorId },
         update: {
-          $setOnInsert: {
-            chunk_id: vectorId,
+          $set: {
             batch_id: batch.id,
             timestamp: null,
             batched_at: new Date(),
