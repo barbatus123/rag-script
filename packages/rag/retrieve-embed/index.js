@@ -104,7 +104,7 @@ export async function main() {
         continue;
       }
 
-      logger.info({ batchId }, 'Processing completed batch');
+      logger.warn({ batchId }, 'Processing completed batch');
 
       async function loadChunks(vectorIds) {
         const queries = vectorIds.map(vectorId => {
@@ -128,7 +128,7 @@ export async function main() {
         }
       });
 
-      logger.info({ chunkEmbeddings: chunkEmbeddings.length }, 'Chunk embeddings loaded');
+      logger.warn({ chunkEmbeddings: chunkEmbeddings.length }, 'Chunk embeddings loaded');
 
       const vectorIdByUUID = {};
       const chunks = await loadChunks(chunkEmbeddings.map(chunk => chunk.vectorId));
@@ -154,7 +154,7 @@ export async function main() {
         };
       });
 
-      logger.info({ weaviateObjects: weaviateObjects.length }, 'Weaviate objects prepared');
+      logger.warn({ weaviateObjects: weaviateObjects.length }, 'Weaviate objects prepared');
 
       const doneVectorIds = [];
       for (let i = 0; i < weaviateObjects.length; i += 1000) {
@@ -200,7 +200,7 @@ export async function main() {
           { $setOnInsert: { timestamp: new Date() } },
           { upsert: true },
         );
-        logger.info({ source: src }, 'SIGNAL_RAG doc upserted');
+        logger.warn({ source: src }, 'SIGNAL_RAG doc upserted');
       }
     }
 

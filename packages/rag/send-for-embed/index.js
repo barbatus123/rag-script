@@ -226,7 +226,7 @@ export async function main(payload = {}, ctx = {}) {
     }
 
     const duration = ((Date.now() - started) / 1000).toFixed(1) + 's';
-    logger.info({ duration, metrics: progress.metrics }, 'sendForEmbed finished');
+    logger.warn({ duration, metrics: progress.metrics }, 'sendForEmbed finished');
 
     return { statusCode: 200, body: JSON.stringify(progress.metrics) };
   } catch (err) {
@@ -275,7 +275,7 @@ async function flushBatch({ reqRows, chunks, col, rateLimiter, progress }) {
     }));
     await col.embIndex.bulkWrite(bulkOps);
     progress.incrementMetric('completedBatches');
-    logger.info({ batchId: batch.id, queued: chunks.length }, 'Batch queued');
+    logger.warn({ batchId: batch.id, queued: chunks.length }, 'Batch queued');
 
     return statusResponse.status;
   } catch (err) {
