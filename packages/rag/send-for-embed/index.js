@@ -13,8 +13,8 @@ function escapeRegExp(string) {
 const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
 
-async function getRecentlyBatchedTokens(col) {
-  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+async function getRecentlyBatchedTokens(col, offsetMins = 0) {
+  const oneDayAgo = Date.now() - (24 * 3_600_000 - offsetMins * 60_000);
 
   const result = await col.embIndex
     .aggregate([
@@ -107,9 +107,9 @@ export async function main(payload = {}, ctx = {}) {
       return { statusCode: 200, body: 'sendForEmbed has already processed all chunks' };
     }
 
-    const recentTokens = await getRecentlyBatchedTokens(col);
+    const recentTokens = await getRecentlyBatchedTokens(col, 10);
     logger.warn({ consumedTokens: recentTokens }, 'Tokens consumed by recent batches');
-    const tokensCapacity = config.orgTokenLimit - (await getRecentEmbeddingRequests()) * 450;
+    const tokensCapacity = config.orgTokenLimit - (await getRecentEmbeddingRequests(10)) * 450;
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
