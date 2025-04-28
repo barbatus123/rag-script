@@ -2,7 +2,7 @@ import { config } from './lib/config.js';
 import { logger } from './lib/logger.js';
 import { getMongo, collections } from './lib/mongo.js';
 import { trimTokens } from './lib/tokenUtils.js';
-import { uploadFile, createBatch, batchStatus, getRecentEmbeddingRequests } from './lib/openai.js';
+import { uploadFile, createBatch, batchStatus } from './lib/openai.js';
 import { RateLimiter } from './lib/rateLimiter.js';
 import { ProgressTracker } from './lib/progressTracker.js';
 
@@ -14,7 +14,7 @@ const SAFETY_WINDOW = 40_000; // ms before deadline to exit the function
 const LOG_EVERY = 1000; // progress log cadence
 
 async function getRecentlyBatchedTokens(col, offsetMins = 0) {
-  const oneDayAgo = Date.now() - (24 * 3_600_000 - offsetMins * 60_000);
+  const oneDayAgo = new Date(Date.now() - (24 * 3_600_000 - offsetMins * 60_000));
 
   const result = await col.embIndex
     .aggregate([
@@ -109,7 +109,7 @@ export async function main(payload = {}, ctx = {}) {
 
     const recentTokens = await getRecentlyBatchedTokens(col, 10);
     logger.warn({ consumedTokens: recentTokens }, 'Tokens consumed by recent batches');
-    const tokensCapacity = config.orgTokenLimit - (await getRecentEmbeddingRequests(10)) * 450;
+    const tokensCapacity = config.orgTokenLimit - recentTokens;
 
     if (tokensCapacity <= 0) {
       logger.warn('sendForEmbed has reached the max tokens per day limit');
